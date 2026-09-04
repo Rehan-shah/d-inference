@@ -2268,6 +2268,11 @@ type Registry struct {
 	// gateWaitReportThreshold, tagged by recorder site (SetGateWaitObserver).
 	gateWaitObserver atomic.Pointer[func(site string, wait time.Duration)]
 
+	// reserveCommitMode selects whether the reservation commit holds r.mu for
+	// reading (shared, default) or writing (global — the kill switch). Read
+	// once from EIGENINFERENCE_RESERVE_COMMIT_MODE at construction.
+	reserveCommitMode reserveCommitMode
+
 	// Env-tunable tracker configs, read once at construction.
 	capacityCooldownCfg capacityCooldownConfig
 	budgetClampCfg      budgetClampConfig
@@ -2357,6 +2362,7 @@ func New(logger *slog.Logger) *Registry {
 		gates:                       make(map[string]*gateState),
 		sessions:                    make(map[string]*Provider),
 		disconnectedStableIDs:       make(map[string]disconnectedStableID),
+		reserveCommitMode:           loadReserveCommitMode(),
 		capacityCooldownCfg:         loadCapacityCooldownConfig(),
 		budgetClampCfg:              loadBudgetClampConfig(),
 		capacityRateCfg:             loadCapacityRateConfig(),

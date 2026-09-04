@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -774,4 +776,73 @@ func (r *Registry) gateCount() int {
 	r.gatesMu.RLock()
 	defer r.gatesMu.RUnlock()
 	return len(r.gates)
+}
+
+// --- reservation commit lock mode ---
+
+// reserveCommitMode selects how commitProviderReservation and
+// ReserveNextFromPlan hold the registry lock while they debit a provider.
+type reserveCommitMode uint8
+
+const (
+	// reserveCommitShared (default) commits under r.mu.RLock + p.mu: the
+	// double-booking guard is the admit re-check under p.mu, the herd guard
+	// is the "winner unchanged since scan" compare under the same p.mu, and
+	// the probe claim is atomic under gate.mu. Commits no longer drain the
+	// fleet-scan reader batch.
+	reserveCommitShared reserveCommitMode = iota
+	// reserveCommitGlobal is the kill switch: commits take r.mu.Lock() and
+	// serialize fleet-wide exactly as before. The recorders stay on their
+	// per-identity gates in both modes — that half is safe on its own.
+	reserveCommitGlobal
+)
+
+// envReserveCommitMode selects the mode: "global" restores the fleet-wide
+// commit serialization; anything else (including unset) is "shared". Read
+// once at Registry construction.
+const envReserveCommitMode = "EIGENINFERENCE_RESERVE_COMMIT_MODE"
+
+func loadReserveCommitMode() reserveCommitMode {
+	return parseReserveCommitMode(os.Getenv(envReserveCommitMode))
+}
+
+func parseReserveCommitMode(raw string) reserveCommitMode {
+	if strings.EqualFold(strings.TrimSpace(raw), "global") {
+		return reserveCommitGlobal
+	}
+	return reserveCommitShared
+}
+
+func (m reserveCommitMode) String() string {
+	if m == reserveCommitGlobal {
+		return "global"
+	}
+	return "shared"
+}
+
+// commitLock is the registry lock held across a reservation commit in the
+// configured mode. A value type so the commit path allocates nothing.
+type commitLock struct {
+	r      *Registry
+	global bool
+}
+
+func (r *Registry) commitLock() commitLock {
+	return commitLock{r: r, global: r.reserveCommitMode == reserveCommitGlobal}
+}
+
+func (l commitLock) lock() {
+	if l.global {
+		l.r.mu.Lock()
+	} else {
+		l.r.mu.RLock()
+	}
+}
+
+func (l commitLock) unlock() {
+	if l.global {
+		l.r.mu.Unlock()
+	} else {
+		l.r.mu.RUnlock()
+	}
 }

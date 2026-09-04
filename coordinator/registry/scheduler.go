@@ -485,8 +485,10 @@ type providerReservationScan struct {
 //
 // In-flight token-budget ledger: the reservation itself IS the debit. Expensive
 // fleet scans share r.mu for reading; the winner is then re-snapshotted and
-// committed inside a short r.mu WRITE section. addPendingLocked records the
-// request before that section ends, so every later commit sees the debit through
+// committed inside a short section under the winner's p.mu (r.mu is only read
+// — see commitProviderReservation; the global mode is the kill switch).
+// addPendingLocked records the request before that section ends, so every
+// later commit on that provider sees the debit through
 // fillSnapshotPendingAndPool and freeMemoryAdmits (including the reconstructed
 // whole-box pool) before it can reserve. Concurrent scans therefore do not
 // double-spend reported headroom across models. Heartbeat re-sync remains safe:
@@ -527,7 +529,7 @@ func (r *Registry) reserveProvider(model string, pr *PendingRequest, wantPlan bo
 			return nil, failedDecision(), nil
 		}
 
-		// AdmitUS covers the commit phase: the write-lock wait plus the
+		// AdmitUS covers the commit phase: the lock waits plus the
 		// current-state re-check and the pending debit.
 		tCommitStart := time.Now()
 		provider, candidate, outcome, rejected := r.commitProviderReservation(
@@ -564,8 +566,8 @@ func (r *Registry) reserveProvider(model string, pr *PendingRequest, wantPlan bo
 
 // scanProviderReservation performs the expensive fleet walk under a shared
 // registry lock. Concurrent requests may scan together; no provider capacity is
-// consumed until commitProviderReservation acquires the short write section and
-// revalidates the winner against current cross-model pending debits.
+// consumed until commitProviderReservation takes the winner's p.mu and
+// revalidates it against current cross-model pending debits.
 func (r *Registry) scanProviderReservation(model string, pr *PendingRequest, excludeIDs ...string) providerReservationScan {
 	// Profiler stamps: scan-lock wait (from here to the scan RLock) and the
 	// scan itself land on the decision as LockWaitUS / ScanUS; ~25 ns each.
@@ -629,19 +631,34 @@ func (r *Registry) scanProviderReservation(model string, pr *PendingRequest, exc
 	return result
 }
 
-// commitProviderReservation is the short serialized phase. It repeats the full
+// commitProviderReservation is the short commit phase. It repeats the full
 // current-state capacity chain before adding the pending debit, so concurrent
 // scans cannot double-spend a provider's shared cross-model token pool.
+//
+// Locking (reserveCommitShared, the default): r.mu is held for READING — the
+// commit needs the provider identity, catalog and cache-routing configuration
+// to be stable, not the fleet to be frozen — and everything that decides the
+// reservation runs under the winner's p.mu in ONE section: the fresh snapshot,
+// the cost rebuild, the "winner unchanged since scan" compare, the admit
+// re-check, the probe claim and the pending debit. Double-booking is prevented
+// where it always was (providerCanAdmitLockedEx + addPendingLocked under
+// p.mu); the herd compare is exact because it compares the winner's own
+// counters read under the same p.mu that debits them; the half-open probe
+// claim is check-and-claim under gate.mu. Nothing here drains the fleet-scan
+// reader batch, which is what each write acquisition cost before.
+// reserveCommitGlobal takes r.mu for writing instead — the previous
+// fleet-wide serialization, kept as the kill switch.
 func (r *Registry) commitProviderReservation(
 	model string,
 	pr *PendingRequest,
 	scan providerReservationScan,
 	excludeIDs ...string,
 ) (*Provider, *routingCandidate, reservationCommitOutcome, RoutingDecision) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	lock := r.commitLock()
+	lock.lock()
+	defer lock.unlock()
 
-	// The shared scan and write-lock wait consume the same absolute request
+	// The shared scan and any lock wait consume the same absolute request
 	// clock as queueing and provider handoff. Never debit capacity for work whose
 	// first-content budget is already gone. One clock read serves the whole
 	// commit section (deadline, re-snapshot, cost, admit, probe claim).
@@ -666,8 +683,8 @@ func (r *Registry) commitProviderReservation(
 
 	// A breaker bypass is valid only while breaker-open providers remain the
 	// sole route. Re-run the normal pass at commit time; this rare emergency path
-	// may scan under the write lock so a newly healthy provider cannot race the
-	// fail-open decision.
+	// re-scans under the commit lock so a newly healthy provider is preferred
+	// over the fail-open choice.
 	if scan.candidates.ignoreProviderBreaker {
 		normalWinner, normal := r.selectBestCandidateScanLocked(
 			model, pr, false, excludeIDs...)
@@ -678,6 +695,8 @@ func (r *Registry) commitProviderReservation(
 		}
 	}
 
+	// Ownership / serial filters take p.mu themselves — evaluate them before
+	// the commit section below acquires it.
 	owned := providerOwnedBy(p, pr.OwnerAccountID)
 	if pr.SelfRouteOnly && !owned {
 		return nil, nil, reservationCandidateRejected, RoutingDecision{}
@@ -692,19 +711,20 @@ func (r *Registry) commitProviderReservation(
 		}
 	}
 	relaxTrust := owned && (pr.SelfRouteOnly || pr.PreferOwner)
-	snapshot, ok := r.snapshotProviderLockedEx(
-		p, model, pr.Traits, relaxTrust, scan.candidates.ignoreProviderBreaker, now)
-	if !ok {
+
+	// Commit section: snapshot, cost, compare, admit and debit under ONE p.mu
+	// hold, so no other commit can change this provider between the compare
+	// and the debit.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var snapshot routingSnapshot
+	if ok, _ := r.snapshotProviderIntoPLockedEx(
+		&snapshot, p, model, pr.Traits, relaxTrust, scan.candidates.ignoreProviderBreaker, now); !ok {
 		return nil, nil, reservationCandidateRejected, RoutingDecision{}
 	}
-	if pr.RequiresVision {
-		p.mu.Lock()
-		servesVision := r.providerServesVisionModelLocked(p, model, relaxTrust)
-		p.mu.Unlock()
-		if !servesVision {
-			return nil, nil, reservationCandidateRejected,
-				routingDecisionForCommitRejection(model, rejectVisionUnsupported, false)
-		}
+	if pr.RequiresVision && !r.providerServesVisionModelLocked(p, model, relaxTrust) {
+		return nil, nil, reservationCandidateRejected,
+			routingDecisionForCommitRejection(model, rejectVisionUnsupported, false)
 	}
 	candidate, reason, ok := r.buildCandidateWithReason(snapshot, pr, now)
 	if !ok {
@@ -716,11 +736,13 @@ func (r *Registry) commitProviderReservation(
 		return nil, nil, reservationCandidateRejected,
 			routingDecisionForCommitRejection(model, rejectNone, true)
 	}
-	r.applyCacheRoutingDiscount(p, model, pr, candidate)
+	r.applyCacheRoutingDiscountPLocked(p, model, pr, candidate)
 
 	// Another reservation changed this winner after the shared scan. Re-scan the
 	// fleet so cost ranking observes that debit instead of herding the whole scan
-	// cohort onto the formerly-cheapest provider.
+	// cohort onto the formerly-cheapest provider. The counters compared here
+	// were read under the p.mu this section still holds, so a concurrent commit
+	// on the same provider is either fully before (and visible) or fully after.
 	if snapshot.pendingForModel != selected.snapshot.pendingForModel ||
 		snapshot.totalPending != selected.snapshot.totalPending ||
 		candidate.effectiveQueue != selected.effectiveQueue ||
@@ -728,14 +750,11 @@ func (r *Registry) commitProviderReservation(
 		return nil, nil, reservationNeedsRescan, RoutingDecision{}
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !r.providerCanAdmitLockedEx(
 		p, model, pr.Traits, relaxTrust, scan.candidates.ignoreProviderBreaker, now) ||
 		(pr.RequiresVision && !r.providerServesVisionModelLocked(p, model, relaxTrust)) {
 		return nil, nil, reservationCandidateRejected, RoutingDecision{}
 	}
-
 	// Half-open capacity probe: check-and-claim under gate.mu (p.mu → gate.mu).
 	// A pair whose expired cooldown was claimed by a concurrent commit for the
 	// same identity is closed again; reject rather than leak a second probe.
@@ -877,15 +896,27 @@ func routingDecisionForCandidate(model string, provider *Provider, candidate *ro
 }
 
 // applyCacheRoutingDiscount reads the candidate's own snapshot (the scan
-// builds it in place; no copy is taken).
+// builds it in place; no copy is taken). The caller does NOT hold p.mu (the
+// scan): the hint currency check takes it.
 func (r *Registry) applyCacheRoutingDiscount(p *Provider, model string, pr *PendingRequest, candidate *routingCandidate) {
-	if len(pr.cacheRoutingHints) == 0 {
-		return
-	}
 	hint, ok := pr.cacheRoutingHints[p.ID]
 	if !ok || !hint.currentForProvider(p, model) {
 		return
 	}
+	r.applyCacheHintDiscount(hint, candidate)
+}
+
+// applyCacheRoutingDiscountPLocked is applyCacheRoutingDiscount for a caller
+// that already holds p.mu (the reservation commit).
+func (r *Registry) applyCacheRoutingDiscountPLocked(p *Provider, model string, pr *PendingRequest, candidate *routingCandidate) {
+	hint, ok := pr.cacheRoutingHints[p.ID]
+	if !ok || !hint.currentForProviderLocked(p, model) {
+		return
+	}
+	r.applyCacheHintDiscount(hint, candidate)
+}
+
+func (r *Registry) applyCacheHintDiscount(hint cacheRoutingHint, candidate *routingCandidate) {
 	prefillTPS := resolvePrefillTPS(&candidate.snapshot)
 	if prefillTPS <= 0 || math.IsNaN(prefillTPS) || math.IsInf(prefillTPS, 0) {
 		return
@@ -1762,36 +1793,25 @@ func (r *Registry) providerRoutingGateReasonLockedEx(p *Provider, model string, 
 	return true, GateReasonCount
 }
 
-// snapshotProviderLockedEx builds a routing snapshot for p, returning ok=false
-// when p fails any structural/privacy/capacity/trait gate. selfRouteOwner is
-// true when this is a self-route request and p is owned by the requesting
-// account. It (1) drops the hardware-trust floor to TrustNone — a personal Mac
-// will not be MDM/MDA enrolled, so without this it would be unroutable to its
-// own owner — and (2) admits a private-only machine, which is otherwise
-// excluded from the public fleet. Every privacy-critical gate (RuntimeVerified,
-// private-text support, challenge freshness) still applies, so plaintext is
-// never exposed and only the genuinely-signed provider binary serves. traits
-// carry the request shape into the shape-keyed inference-error cooldown and the
-// render-broken / version-floor eligibility gates.
+// snapshotProviderIntoLockedEx builds a routing snapshot for p into
+// caller-owned storage, returning ok=false and the closed GateReason when p
+// fails any structural/privacy/capacity/trait gate. selfRouteOwner is true
+// when this is a self-route request and p is owned by the requesting account:
+// it (1) drops the hardware-trust floor to TrustNone — a personal Mac will not
+// be MDM/MDA enrolled, so without this it would be unroutable to its own owner
+// — and (2) admits a private-only machine, which is otherwise excluded from
+// the public fleet. Every privacy-critical gate (RuntimeVerified, private-text
+// support, challenge freshness) still applies. traits carry the request shape
+// into the shape-keyed inference-error cooldown and the render-broken /
+// version-floor eligibility gates. ignoreProviderBreaker is threaded into the
+// routing gate: only the selectBestCandidateLockedFull fail-open fallback pass
+// sets it true. now is the scan clock: hot-path callers walk the whole fleet
+// and must read the wall clock ONCE per scan, not once per provider; every
+// time-keyed gate (challenge freshness, cooldowns, breaker, clamp) evaluates
+// against that single instant.
 //
-// ignoreProviderBreaker is threaded into the routing gate: only the
-// selectBestCandidateLockedFull fail-open fallback pass sets it true (to bypass
-// the node-health breaker); every other caller passes false. (The former
-// breaker-honored wrapper snapshotProviderLocked is gone — the fleet walks use
-// snapshotProviderIntoLockedEx directly.) now is the scan clock: hot-path callers
-// walk the whole fleet and must read the wall clock ONCE per scan, not once
-// per provider (runtime.walltime was ~35% of the reservation scan at fleet
-// scale); every time-keyed gate below (challenge freshness, cooldowns,
-// breaker, clamp) evaluates against that single instant.
-func (r *Registry) snapshotProviderLockedEx(p *Provider, model string, traits RequestTraits, selfRouteOwner bool, ignoreProviderBreaker bool, now time.Time) (routingSnapshot, bool) {
-	var snap routingSnapshot
-	ok, _ := r.snapshotProviderIntoLockedEx(&snap, p, model, traits, selfRouteOwner, ignoreProviderBreaker, now)
-	return snap, ok
-}
-
-// snapshotProviderIntoLockedEx is snapshotProviderLockedEx writing into
-// caller-owned storage instead of returning the (large) snapshot by value,
-// and naming WHICH gate dropped a failing provider. The fleet walks
+// Writes into caller-owned storage instead of returning the (large) snapshot
+// by value, and names WHICH gate dropped a failing provider. The fleet walks
 // (scanCandidatesLocked, PredictServable) and the fleet sampler
 // (slotEligibilityReasonLocked) hand it the final resting place of the
 // snapshot — a candidate-arena slot or a reused buffer — so a routable
@@ -1805,7 +1825,15 @@ func (r *Registry) snapshotProviderLockedEx(p *Provider, model string, traits Re
 func (r *Registry) snapshotProviderIntoLockedEx(dst *routingSnapshot, p *Provider, model string, traits RequestTraits, selfRouteOwner bool, ignoreProviderBreaker bool, now time.Time) (bool, GateReason) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return r.snapshotProviderIntoPLockedEx(dst, p, model, traits, selfRouteOwner, ignoreProviderBreaker, now)
+}
 
+// snapshotProviderIntoPLockedEx is snapshotProviderIntoLockedEx for a caller
+// that ALREADY holds p.mu — the reservation commit and the plan consumption,
+// which take the snapshot, rebuild the cost, compare and debit inside one p.mu
+// section so nothing can change the provider in between. Caller holds r.mu
+// (either mode) and p.mu.
+func (r *Registry) snapshotProviderIntoPLockedEx(dst *routingSnapshot, p *Provider, model string, traits RequestTraits, selfRouteOwner bool, ignoreProviderBreaker bool, now time.Time) (bool, GateReason) {
 	if ok, reason := r.providerRoutingGateReasonLockedEx(p, model, traits, selfRouteOwner, now, ignoreProviderBreaker, false); !ok {
 		return false, reason
 	}
