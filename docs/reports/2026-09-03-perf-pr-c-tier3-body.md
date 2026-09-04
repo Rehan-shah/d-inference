@@ -43,7 +43,10 @@ reads the two hot booleans (breaker open, ejected) from atomics and a per-gate f
 per-model trackers hold state, so a provider with no fault state costs the scan a few atomic loads and
 no lock section. The size-triggered map sweeps (>1024 / >2048 walks under the write lock) became a
 periodic per-gate sweep from the eviction loop. Identity rebinds migrate a gate's state and forward the
-orphan, so a recorder holding a stale pointer still lands on the live state.
+orphan, so a recorder holding a stale pointer still lands on the live state; and because a recorder
+resolves its gate under `gatesMu.RLock` but locks it only after letting go of `gatesMu`, it re-validates
+the gate under `gate.mu` once acquired (not retired by the sweep, still the session's cached gate) and
+re-resolves through the index otherwise (see "Review follow-ups").
 
 **(a′) Commit without the global write lock.** `commitProviderReservation` and
 `ReserveNextFromPlan` hold `r.mu` for **reading** (identity, catalog and cache-routing config only)
@@ -123,9 +126,9 @@ flowchart TB
 | Probe claim atomic w.r.t. other commits | `gateState.tryClaimCapacityProbe`: check **and** claim in one `gate.mu` section, per identity; a closed gate rejects the reservation instead of leaking a second probe. Test: two sessions of one identity racing → exactly one claim. |
 | Fleet-wide serialization makes the "unchanged since scan" compare exact (herd avoidance) | The four-field compare runs against a snapshot taken under the **same `p.mu` hold that debits**; only the winner's own counters are compared, so `p.mu` suffices. A concurrent commit on the same provider is either fully before (visible → rescan) or fully after. |
 | Stale gate state seen by a scan | Already tolerated between scan RUnlock and commit; the commit re-checks under `p.mu`/`gate.mu`. Readers of a gate being migrated see either the intact pre-merge view or the forward, never the reset (forward is stored before reset). |
-| Identity rebind moves accumulated fault state | `bindStableFaultKey` migrates `gateState` → `gateState` under `gatesMu.Lock` (the only place two gate locks nest); stale pointers follow `forwardTo`; a shared identity gate with other live sessions is emptied, not orphaned. |
+| Identity rebind moves accumulated fault state | `bindStableFaultKey` migrates `gateState` → `gateState` under `gatesMu.Lock` (the only place two gate locks nest); stale pointers follow `forwardTo`; a recorder holding a stale pointer re-validates under `gate.mu` (not retired, still the session's cached gate) and re-resolves through the index otherwise; the session is repointed inside the migration's two-gate locked section, so a recorder holding the source either wrote before the merge (its outcome travels) or sees the pointer moved. A shared identity gate with other live sessions is emptied, not orphaned — the repointed `p.gate` is what tells a stale holder its outcome now belongs to the new gate. The lock-free "no per-model state" fast paths (probe claim, the clear recorders) trust a cleared flag only while `p.gate` still points at the gate it was read from (`refHasPairState`). |
 | Fault state survives Disconnect; identity-less residue is dropped | `detachSessionGate`: caches the stable id for the trailing flush and keeps the identity's gate; a session-keyed gate (no identity) is dropped at Disconnect. |
-| Bounded maps | Periodic `sweepGates` from the eviction loop (plus a rate-limited inline sweep past 4096 gates): prunes dead per-model entries; drops gates with no live session once idle for 10 min. Half-open trip memory of a **live** gate is never pruned (the old size-triggered sweeps only ran past 1024 entries). |
+| Bounded maps | Periodic `sweepGates` from the eviction loop (plus a rate-limited inline sweep past 4096 gates): prunes dead per-model entries; drops gates with no live session once idle for 10 min, marking them `retired` under `gate.mu` before the index delete so a recorder that resolved the gate before the walk re-resolves instead of writing into it. A gate's **creation counts as activity** for the idle grace, so a gate filed for a disconnected identity (the trailing flush's first fault, a serve outcome by stable id) cannot be swept before the recorder that created it takes the lock — an untouched disconnected identity therefore lingers ≤ 10 min instead of dropping on the first sweep (negligible: one empty `gateState`). Half-open trip memory of a **live** gate is never pruned (the old size-triggered sweeps only ran past 1024 entries). |
 
 ## Mode flag
 
@@ -144,7 +147,9 @@ The request-path suites run in both modes (`forEachCommitMode`).
   `inference_error`, `inference_success`, `capacity_reject`, `capacity_accept`,
   `dispatch_load_failure`, `dispatch_load_clear`, `clamp_heartbeat`), emitted only when a `gate.mu`
   wait exceeds 1 ms (uncontended path: one `TryLock`, no clock reads). Distinct from #818's
-  `registry.mu.write_wait_ms`.
+  `registry.mu.write_wait_ms`. The commit-path probe claim (`capacity_probe` site) takes the same
+  gate lock but does not report its wait: it runs under `p.mu` (and `r.mu` in `global` mode), where the
+  emit must not happen; the recorders' waits on the same gates cover it.
 - The #809 per-attempt stamps (`lock_wait_us`, `scan_us`, `admit_us`) are the acceptance metric.
 
 ## Bench (this box: M-series, 16 threads, `-benchtime 2s -count 2`; load average 330–380 on 16 cores during both runs — treat absolute numbers as ±30%, ratios within a run as the signal)
@@ -213,6 +218,35 @@ only read-side touch left near a recorder is the budget snapshot for the clamp
 (`providerReportsTokenBudget`/`providerBudgetSnapshot`), which reads `p.BackendCapacity` under
 `p.mu` via the `sessions` index — no `r.mu` at all.
 
+## Review follow-ups
+
+Codex left two P2 findings on the gate index; both were legitimate and share one root cause — a
+recorder resolves its gate under `gatesMu.RLock` but locks it only after releasing `gatesMu`, a
+window the map-keyed code never had (key resolution and the write shared one `r.mu.Lock` section
+with the bind). Fixed by re-validating the gate under `gate.mu` after acquiring it and re-resolving
+through the index otherwise (`gateRef` / `lockGate`, `retired`, the repoint inside the migration's
+locked section, creation-counts-as-touched):
+
+- **F1 — recorders racing a shared-identity rebind** (`migrateGateLocked(..., false)` reset the shared
+  gate without a forward; a recorder holding the old pointer wrote into the emptied gate that now
+  belonged to the other session — a success left the migrated clamp/cooldown unreleased, a fault
+  poisoned the other identity's breaker). The removed comment claiming parity with the map-keyed
+  implementation was wrong. Commit `d21e0d48f`.
+- **F2 — the sweep dropping in-flight recorder updates** (the sweep decided under `gate.mu`, unlocked,
+  deleted; a trailing-flush recorder that had already resolved the pointer wrote the disconnect 502
+  into a gate no lookup would find — `evictStale` runs `Disconnect` then `sweepGates` in the same
+  pass, and a gate created for a disconnected identity had `touched == 0`). Commit `d21e0d48f`.
+- **Adjacent gap found while fixing F1 — the commit-path probe claim** (`tryClaimCapacityProbe` via
+  `gateOf(p).lockResolved()` mutated `probeAt` with no session check, so a rebind racing a commit could
+  leak one probe through a cooled pair; the lock-free "no state" fast path had the same hole one layer
+  up — an emptied source gate's flag says "nothing" because the state moved). Now claimed through the
+  same validated lock, both commit modes, with `refHasPairState` confirming a cleared flag against
+  `p.gate`. Commit `020fac64f`.
+
+Deliberately unchanged: `detachSessionGate` does not retire the session-keyed gate it drops at
+Disconnect — a recorder racing it writes into residue that is dropped by design (see "Disconnect of
+an identity-less session drops all of that session's fault residue" above).
+
 ## Tests
 
 - `reserve_commit_test.go`: exact-capacity concurrent commit through `ReserveProviderEx` AND through
@@ -225,7 +259,13 @@ only read-side touch left near a recorder is the budget snapshot for the clamp
   parallel speed-up guard; the mode-flag parser (unknown values fall back to `shared` and are logged).
 - `gate_state_test.go`: stale-pointer migration, no empty-gate window for lock-free readers during a
   live re-attestation, shared-identity rebind, sweep liveness rule, trailing-flush resolution,
-  exclusive probe claim, nil-safety, wait observer, recorders never block behind `r.mu.Lock`.
+  exclusive probe claim, nil-safety, wait observer, recorders never block behind `r.mu.Lock`; from
+  the review follow-ups: a stale ref across a shared-identity rebind lands on the session's new gate
+  and leaves the other identity untouched; a stale ref across a sweep of a disconnected gate lands on
+  the gate a fresh lookup finds (by session and by stable id); a clear keeps the retired gate and
+  files nothing; a fresh gate survives the first sweep; a rebind between the probe's resolution and
+  its claim lands the claim on the new gate in both commit modes; the lock-free fast path follows
+  the rebind; recorders + probe claims racing rebinds and sweeps under `-race`.
 - `request_path_probe_test.go`: the probe benches from 01.
 - Existing tracker suites adapted to the gate API (helpers only; assertions unchanged); index ==
   brute-force, routing_context, fleet_sample and gate-tally suites untouched and green.
