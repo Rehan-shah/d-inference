@@ -1002,7 +1002,11 @@ func dispatchErrorClass(errText string) string {
 // routed through updateInferenceRouteOutcomeForPending, which would also fire
 // the cache-selection terminal for a request that never had a provider.
 func (d *dispatchState) queuedExitOutcome(ap *registry.AttemptProfile, status, reason string, code int) {
-	d.updateRoutingOutcome(d.errorRoutingOutcome(status, reason, code))
+	outcome := d.errorRoutingOutcome(status, reason, code)
+	// No provider attempt was dispatched: the funnel counts this exit on
+	// inference.queue_outcome, never on inference.attempt_outcome.
+	outcome.QueueExit = true
+	d.updateRoutingOutcome(outcome)
 	ap.SetOutcome(status, reason, "", "", "")
 }
 

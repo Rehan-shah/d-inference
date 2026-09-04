@@ -526,3 +526,146 @@ func TestFleetGauges_QueueDepth(t *testing.T) {
 		}
 	}
 }
+
+func TestQueueOutcomeClass_Mapping(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome store.InferenceRouteOutcome
+		want    string
+	}{
+		{"pre-fill (non-terminal) is not counted", store.InferenceRouteOutcome{}, ""},
+		{"client gone while queued", store.InferenceRouteOutcome{FinalStatus: finalStatusCancelled, ErrorClass: "client_gone"}, queueClassClientGone},
+		{"queue_deadline", store.InferenceRouteOutcome{FinalStatus: finalStatusTimeout, ErrorClass: rejectionReasonQueueDeadline}, queueClassQueueDeadline},
+		{"queue_timeout", store.InferenceRouteOutcome{FinalStatus: finalStatusTimeout, ErrorClass: "queue_timeout"}, queueClassQueueTimeout},
+		{"ttft_too_slow", store.InferenceRouteOutcome{FinalStatus: finalStatusError, ErrorClass: "ttft_too_slow"}, queueClassTTFTTooSlow},
+		{"tool constraint unavailable", store.InferenceRouteOutcome{FinalStatus: finalStatusError, ErrorClass: "model_capability_unsupported"}, queueClassCapabilityUnsupported},
+		{"unknown exit class is other", store.InferenceRouteOutcome{FinalStatus: finalStatusError, ErrorClass: "something_new"}, queueClassOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := queueOutcomeClass(&tc.outcome); got != tc.want {
+				t.Fatalf("queueOutcomeClass = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := queueOutcomeClass(nil); got != "" {
+		t.Fatalf("nil outcome class = %q, want empty", got)
+	}
+}
+
+// TestEmitAttemptOutcomeMetric_QueueExitIsNotAnAttempt: the same terminal
+// outcome reaches the funnel twice — once flagged as a queue-wait exit (no
+// provider attempt was dispatched) and once as a dispatched attempt. Only the
+// latter may increment attempt_outcome; the former lands on queue_outcome.
+// Both the in-process registry and the DogStatsD sink are asserted.
+func TestEmitAttemptOutcomeMetric_QueueExitIsNotAnAttempt(t *testing.T) {
+	srv, _ := testServer(t)
+	collector := newUDPCollector(t)
+	defer collector.Close()
+	dd := newTestDD(t, collector)
+	defer dd.Close()
+	srv.SetDatadog(dd)
+
+	const model = "queue-exit-unit-model"
+	attemptTotal := func(snap MetricsSnapshot) int64 {
+		var total int64
+		for key, v := range snap.Counters {
+			if strings.HasPrefix(key, metricAttemptOutcomeCounter) && strings.Contains(key, "model="+model) {
+				total += v
+			}
+		}
+		return total
+	}
+
+	queued := &store.InferenceRouteOutcome{FinalStatus: finalStatusTimeout, ErrorClass: rejectionReasonQueueDeadline, ErrorCode: http.StatusGatewayTimeout, QueueExit: true}
+	srv.emitAttemptOutcomeMetric(model, queued)
+	snap := srv.metrics.Snapshot()
+	if got := attemptTotal(snap); got != 0 {
+		t.Fatalf("attempt_outcome after a queue exit = %d, want 0; counters=%v", got, snap.Counters)
+	}
+	if got := snap.Counters[counterKey(metricQueueOutcomeCounter,
+		MetricLabel{"model", model}, MetricLabel{"class", queueClassQueueDeadline})]; got != 1 {
+		t.Fatalf("queue_outcome{queue_deadline} = %d, want 1; counters=%v", got, snap.Counters)
+	}
+
+	// A queue exit that never became terminal is not counted anywhere.
+	srv.emitAttemptOutcomeMetric(model, &store.InferenceRouteOutcome{QueueExit: true})
+
+	// The same class from a DISPATCHED attempt still counts as an attempt.
+	dispatched := &store.InferenceRouteOutcome{FinalStatus: finalStatusTimeout, ErrorClass: rejectionReasonQueueDeadline, ErrorCode: http.StatusGatewayTimeout}
+	srv.emitAttemptOutcomeMetric(model, dispatched)
+	snap = srv.metrics.Snapshot()
+	if got := attemptTotal(snap); got != 1 {
+		t.Fatalf("attempt_outcome after a dispatched terminal = %d, want 1; counters=%v", got, snap.Counters)
+	}
+	if got := snap.Counters[counterKey(metricAttemptOutcomeCounter,
+		MetricLabel{"model", model}, MetricLabel{"class", attemptClassCapacity})]; got != 1 {
+		t.Fatalf("attempt_outcome{capacity} = %d, want 1; counters=%v", got, snap.Counters)
+	}
+	var queueTotal int64
+	for key, v := range snap.Counters {
+		if strings.HasPrefix(key, metricQueueOutcomeCounter) && strings.Contains(key, "model="+model) {
+			queueTotal += v
+		}
+	}
+	if queueTotal != 1 {
+		t.Fatalf("queue_outcome total = %d, want exactly the one queue exit; counters=%v", queueTotal, snap.Counters)
+	}
+
+	_ = dd.Statsd.Flush()
+	packets := collector.drain()
+	if got := sumMetric(t, packets, metricQueueOutcome, "model:"+model, "class:"+queueClassQueueDeadline); got != 1 {
+		t.Errorf("UDP queue_outcome{queue_deadline} = %v, want 1; packets=%v", got, findMetrics(packets, metricQueueOutcome))
+	}
+	if got := sumMetric(t, packets, metricAttemptOutcome, "model:"+model); got != 1 {
+		t.Errorf("UDP attempt_outcome total = %v, want 1 (the dispatched terminal only); packets=%v", got, findMetrics(packets, metricAttemptOutcome))
+	}
+}
+
+// TestQueuedExit_LiveQueueDeadline_CountsOnQueueOutcome drives the REAL HTTP
+// + WebSocket path: the single slot is saturated, the request queues, and the
+// first-content clock expires inside the queue wait. Nothing was dispatched,
+// so attempt_outcome must stay at zero for the model while queue_outcome
+// records exactly one queue_deadline — the amplification denominator must not
+// move for a request no provider ever received.
+func TestQueuedExit_LiveQueueDeadline_CountsOnQueueOutcome(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	const model = "queue-exit-live-model"
+	srv, _, _, ts := queuedFleetHarness(t, ctx, ServerConfig{FirstContentDeadlineBase: 400 * time.Millisecond}, model)
+	collector := newUDPCollector(t)
+	defer collector.Close()
+	dd := newTestDD(t, collector)
+	defer dd.Close()
+	srv.SetDatadog(dd)
+
+	res := chatRequestWithID(ctx, ts.URL, model, "queue-exit-live")
+	if res.err != nil {
+		t.Fatalf("chat request: %v", res.err)
+	}
+	if res.status != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", res.status, res.body)
+	}
+
+	queueKey := counterKey(metricQueueOutcomeCounter, MetricLabel{"model", model}, MetricLabel{"class", queueClassQueueDeadline})
+	snap := waitForCounters(t, srv, 3*time.Second, func(s MetricsSnapshot) bool {
+		return s.Counters[queueKey] >= 1
+	})
+	if got := snap.Counters[queueKey]; got != 1 {
+		t.Fatalf("queue_outcome{queue_deadline} = %d, want 1; counters=%v", got, snap.Counters)
+	}
+	for key, v := range snap.Counters {
+		if strings.HasPrefix(key, metricAttemptOutcomeCounter) && strings.Contains(key, "model="+model) && v != 0 {
+			t.Fatalf("attempt_outcome incremented for a queue-only request: %s=%d; counters=%v", key, v, snap.Counters)
+		}
+	}
+
+	_ = dd.Statsd.Flush()
+	packets := collector.drain()
+	if got := sumMetric(t, packets, metricQueueOutcome, "model:"+model, "class:"+queueClassQueueDeadline); got != 1 {
+		t.Errorf("UDP queue_outcome{queue_deadline} = %v, want 1; packets=%v", got, findMetrics(packets, metricQueueOutcome))
+	}
+	if got := sumMetric(t, packets, metricAttemptOutcome, "model:"+model); got != 0 {
+		t.Errorf("UDP attempt_outcome total = %v, want 0 for a queue-only request; packets=%v", got, findMetrics(packets, metricAttemptOutcome))
+	}
+}

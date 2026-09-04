@@ -24,6 +24,15 @@ import (
 //     first_chunk_timeout / sum(attempt_outcome); amplification is
 //     sum(attempt_outcome) / sum(request_outcome), both per model.
 //
+//   - inference.queue_outcome{model,class} — a request that left the
+//     coordinator queue WITHOUT a provider attempt being dispatched (client
+//     gone, queue_deadline, queue_timeout, ttft_too_slow, tool-constraint
+//     unavailable). Its route row still reaches the funnel, flagged
+//     store.InferenceRouteOutcome.QueueExit by dispatchState.queuedExitOutcome,
+//     and is counted here instead of on attempt_outcome: during a queue
+//     incident thousands of queue expiries would otherwise inflate the
+//     amplification denominator with attempts no provider ever received.
+//
 //   - inference.request_outcome_or_view{model,class} — the number OpenRouter
 //     actually computes. It keeps request_outcome's classes and adds the two
 //     failure kinds request_outcome cannot see: a client that left before the
@@ -42,6 +51,9 @@ const (
 
 	metricRequestOutcomeORView        = "inference.request_outcome_or_view"
 	metricRequestOutcomeORViewCounter = "inference_request_outcome_or_view_total"
+
+	metricQueueOutcome        = "inference.queue_outcome"
+	metricQueueOutcomeCounter = "inference_queue_outcome_total"
 )
 
 // attempt_outcome classes. A fixed vocabulary: anything the mapping does not
@@ -58,6 +70,18 @@ const (
 	attemptClassClientGone          = "client_gone"
 	attemptClassSpeculativeLoser    = "speculative_loser"
 	attemptClassOther               = "other"
+)
+
+// queue_outcome classes: the queue-wait exits that never dispatched an attempt
+// (dispatchState.queuedExitOutcome), keyed by the error_class those exits
+// persist. A fixed vocabulary: anything else lands in `other`.
+const (
+	queueClassClientGone            = "client_gone"
+	queueClassQueueDeadline         = rejectionReasonQueueDeadline
+	queueClassQueueTimeout          = "queue_timeout"
+	queueClassTTFTTooSlow           = "ttft_too_slow"
+	queueClassCapabilityUnsupported = "model_capability_unsupported"
+	queueClassOther                 = "other"
 )
 
 // orClassClientGone is the OR-view class for a client that left before the
@@ -161,11 +185,36 @@ func attemptErrorOutcomeClass(class string, outcome *store.InferenceRouteOutcome
 	return attemptClassOther
 }
 
+// queueOutcomeClass maps the terminal outcome of a queue-wait exit (an
+// outcome flagged QueueExit) to its queue_outcome class. Returns "" for a
+// non-terminal outcome, which must not be counted.
+func queueOutcomeClass(outcome *store.InferenceRouteOutcome) string {
+	if outcome == nil || strings.TrimSpace(outcome.FinalStatus) == "" {
+		return ""
+	}
+	switch class := strings.ToLower(strings.TrimSpace(outcome.ErrorClass)); class {
+	case queueClassClientGone, queueClassQueueDeadline, queueClassQueueTimeout,
+		queueClassTTFTTooSlow, queueClassCapabilityUnsupported:
+		return class
+	default:
+		return queueClassOther
+	}
+}
+
 // emitAttemptOutcomeMetric records one attempt_outcome increment for a
-// terminal route outcome. Called from the route-outcome funnel only.
+// terminal route outcome. Called from the route-outcome funnel only. A
+// queue-wait exit (outcome.QueueExit) dispatched nothing and is counted on
+// queue_outcome instead, so attempt_outcome stays one-per-dispatched-attempt.
 func (s *Server) emitAttemptOutcomeMetric(model string, outcome *store.InferenceRouteOutcome) {
+	if s == nil || outcome == nil {
+		return
+	}
+	if outcome.QueueExit {
+		s.emitQueueOutcomeMetric(model, outcome)
+		return
+	}
 	class := attemptOutcomeClass(outcome)
-	if s == nil || class == "" {
+	if class == "" {
 		return
 	}
 	if model == "" {
@@ -179,6 +228,26 @@ func (s *Server) emitAttemptOutcomeMetric(model string, outcome *store.Inference
 		return
 	}
 	s.ddIncr(metricAttemptOutcome, []string{"model:" + model, "class:" + class})
+}
+
+// emitQueueOutcomeMetric records one queue_outcome increment for the terminal
+// route outcome of a queue-wait exit that never dispatched an attempt.
+func (s *Server) emitQueueOutcomeMetric(model string, outcome *store.InferenceRouteOutcome) {
+	class := queueOutcomeClass(outcome)
+	if s == nil || class == "" {
+		return
+	}
+	if model == "" {
+		model = "unknown"
+	}
+	if s.metrics != nil {
+		s.metrics.IncCounter(metricQueueOutcomeCounter,
+			MetricLabel{"model", model}, MetricLabel{"class", class})
+	}
+	if s.dd == nil {
+		return
+	}
+	s.ddIncr(metricQueueOutcome, []string{"model:" + model, "class:" + class})
 }
 
 // orViewClassForCommittedOutcome maps the terminal outcome of a COMMITTED
