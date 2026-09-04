@@ -363,12 +363,17 @@ func TestGateDecisionsIdenticalAcrossCommitModesUnderConcurrentRecorders(t *test
 // commit the request path must reach at least 4x at 16 threads.
 //
 // The machine's own parallel ceiling is measured alongside (a pure RLock
-// fleet walk, no writers): a box saturated by other work cannot show 4x for
-// ANY lock design, so on such a box the guard falls back to the relative
+// fleet walk, no writers): a box busy with other work cannot show 4x for ANY
+// lock design, so on such a box the guard falls back to the relative
 // property — the request path parallelizes at least 60% as well as the
 // read-only walk — which the old global-write-lock path fails by a wide
-// margin (1.2x vs 3.5x). Skipped under the race detector (it serializes
-// goroutines) and on small machines. Numbers and the load average are logged.
+// margin (1.2x vs 3.5x). Each quantity is the best of three interleaved
+// fixed-work measurements so load drifting between them does not fake a
+// ratio. A box
+// whose 1-minute load average exceeds twice GOMAXPROCS cannot measure
+// parallelism at all (lock-holder preemption dominates every scheme); the
+// numbers are logged and the guard skips. Also skipped under the race
+// detector (it serializes goroutines) and on small machines.
 func TestRequestPathParallelSpeedup(t *testing.T) {
 	if raceDetectorEnabled {
 		t.Skip("throughput guard is meaningless under the race detector")
@@ -388,54 +393,92 @@ func TestRequestPathParallelSpeedup(t *testing.T) {
 		}
 	}
 	var seq atomic.Int64
-	readSerial := testing.Benchmark(func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			walk(i)
-		}
-	})
-	readParallel := testing.Benchmark(func(b *testing.B) {
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				walk(int(seq.Add(1)))
+	path := func(n int) {
+		requestPathOnce(t, f, f.models[n%len(f.models)], n)
+	}
+	// Fixed work per measurement (no iteration search): ops calls, serially or
+	// split evenly across GOMAXPROCS goroutines; the result is ns per op.
+	const ops = 2000
+	timeOps := func(op func(int), parallel bool) int64 {
+		start := time.Now()
+		if !parallel {
+			for i := 0; i < ops; i++ {
+				op(int(seq.Add(1)))
 			}
-		})
-	})
-	pathSerial := testing.Benchmark(func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			n := int(seq.Add(1))
-			requestPathOnce(b, f, f.models[n%len(f.models)], n)
+			return time.Since(start).Nanoseconds() / ops
 		}
-	})
-	pathParallel := testing.Benchmark(func(b *testing.B) {
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				n := int(seq.Add(1))
-				requestPathOnce(b, f, f.models[n%len(f.models)], n)
+		var wg sync.WaitGroup
+		per := ops / procs
+		for w := 0; w < procs; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < per; i++ {
+					op(int(seq.Add(1)))
+				}
+			}()
+		}
+		wg.Wait()
+		return time.Since(start).Nanoseconds() / int64(per*procs)
+	}
+	measure := map[string]func() int64{
+		"read serial":   func() int64 { return timeOps(walk, false) },
+		"read parallel": func() int64 { return timeOps(walk, true) },
+		"path serial":   func() int64 { return timeOps(path, false) },
+		"path parallel": func() int64 { return timeOps(path, true) },
+	}
+	order := []string{"read serial", "read parallel", "path serial", "path parallel"}
+	best := map[string]int64{}
+	for round := 0; round < 3; round++ {
+		for _, name := range order {
+			ns := measure[name]()
+			if cur, ok := best[name]; !ok || ns < cur {
+				best[name] = ns
 			}
-		})
-	})
-	readSpeedup := float64(readSerial.NsPerOp()) / float64(readParallel.NsPerOp())
-	pathSpeedup := float64(pathSerial.NsPerOp()) / float64(pathParallel.NsPerOp())
-	load := "n/a"
-	if out, err := exec.Command("uptime").Output(); err == nil {
-		if i := strings.Index(string(out), "load"); i >= 0 {
-			load = strings.TrimSpace(string(out)[i:])
 		}
 	}
+	readSpeedup := float64(best["read serial"]) / float64(best["read parallel"])
+	pathSpeedup := float64(best["path serial"]) / float64(best["path parallel"])
+	load, load1 := loadAverage()
 	t.Logf("read-only walk: serial %v/op, parallel %v/op, speed-up %.2fx (the box's ceiling)",
-		time.Duration(readSerial.NsPerOp()), time.Duration(readParallel.NsPerOp()), readSpeedup)
+		time.Duration(best["read serial"]), time.Duration(best["read parallel"]), readSpeedup)
 	t.Logf("request path: serial %v/op, parallel %v/op at %d threads, speed-up %.2fx (%s)",
-		time.Duration(pathSerial.NsPerOp()), time.Duration(pathParallel.NsPerOp()), procs, pathSpeedup, load)
+		time.Duration(best["path serial"]), time.Duration(best["path parallel"]), procs, pathSpeedup, load)
+	if load1 > 2*float64(procs) {
+		t.Skipf("box saturated (1-minute load %.0f on %d procs): parallelism cannot be measured here", load1, procs)
+	}
 	if readSpeedup >= 4 {
 		if pathSpeedup < 4 {
 			t.Fatalf("request path parallel speed-up %.2fx at %d threads, want >= 4x (a walk-wide lock is back?)", pathSpeedup, procs)
 		}
 		return
 	}
-	// Saturated box: hold the relative property instead.
+	// Busy box: hold the relative property instead.
 	if pathSpeedup < 0.6*readSpeedup {
 		t.Fatalf("request path parallel speed-up %.2fx is below 60%% of the read-only walk's %.2fx on this box (a walk-wide lock is back?)",
 			pathSpeedup, readSpeedup)
 	}
-	t.Logf("box saturated (read-only ceiling %.2fx < 4x): asserted the relative property only", readSpeedup)
+	t.Logf("busy box (read-only ceiling %.2fx < 4x): asserted the relative property only", readSpeedup)
+}
+
+// loadAverage returns uptime's load-average text and the parsed 1-minute
+// value (0 when unavailable).
+func loadAverage() (text string, load1 float64) {
+	out, err := exec.Command("uptime").Output()
+	if err != nil {
+		return "load n/a", 0
+	}
+	text = "load n/a"
+	if i := strings.Index(string(out), "load"); i >= 0 {
+		text = strings.TrimSpace(string(out)[i:])
+	}
+	// "load averages: 1.23 4.56 7.89" (darwin) / "load average: 1.23, 4.56, 7.89" (linux)
+	fields := strings.Fields(strings.NewReplacer(",", " ", ":", " ").Replace(text))
+	for i, fld := range fields {
+		if strings.HasPrefix(fld, "average") && i+1 < len(fields) {
+			fmt.Sscanf(fields[i+1], "%f", &load1)
+			break
+		}
+	}
+	return text, load1
 }
