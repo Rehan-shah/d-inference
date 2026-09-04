@@ -165,3 +165,5 @@ branch and out of scope here.
   depends on the PR B registry changes.
 - Known flakes not touched here: `promptcontract` supervisor tests under load;
   `TestMDMSchedulerDuePagingCannotStarveLiveRowBehindDisconnectedPrefix`.
+
+Follow-on: the wave-1/2 coordinator fixes that stack on the A+B integration base are recorded in [`2026-09-03-perf-pr-cd-body.md`](2026-09-03-perf-pr-cd-body.md).
