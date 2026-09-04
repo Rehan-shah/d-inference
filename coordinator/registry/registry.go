@@ -2113,6 +2113,9 @@ type Registry struct {
 	providers map[string]*Provider
 
 	queue *RequestQueue
+	// drainSuppress rate-limits HEARTBEAT-triggered queue drains per model
+	// after a saturated pass (queue_drain_suppress.go). Zero value ready.
+	drainSuppress queueDrainSuppressor
 
 	MinTrustLevel TrustLevel
 
@@ -4150,8 +4153,10 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 
 	// Heartbeats can make a recovered slot routable again (for example after a
 	// crash auto-restart). Drain matching queues using the canonical scheduler
-	// rather than the legacy direct queue assignment path.
-	r.drainQueuedRequestsForModelsWithReason(providerModelIDs(p), DrainTriggerHeartbeat)
+	// rather than the legacy direct queue assignment path. Heartbeats are the
+	// one trigger that is rate-limited after a saturated pass
+	// (queue_drain_suppress.go); every capacity-freeing trigger drains at once.
+	r.drainQueuedRequestsForHeartbeat(providerModelIDs(p))
 
 	// If queue drain didn't satisfy all pending requests (no warm provider),
 	// check if a cold provider should swap models to serve queued demand —

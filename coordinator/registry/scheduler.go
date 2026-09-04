@@ -3163,6 +3163,13 @@ func (r *Registry) drainQueuedRequestsForModelsWithReason(models []string, reaso
 	}
 	for _, model := range models {
 		var skipped []*QueuedRequest
+		// rejected anchors the per-pass dominance skip (queue_drain_dominance.go)
+		// and deliberately survives requeueSkipped: an admission only removes
+		// capacity, so this pass's verdicts stay valid for the requeued waiters
+		// the next PopNextFresh hands back.
+		var rejected []drainRejectionRecord
+		admitted := 0
+		saturated := false
 		requeueSkipped := func() {
 			for i := len(skipped) - 1; i >= 0; i-- {
 				queue.RequeueFront(skipped[i])
@@ -3188,6 +3195,14 @@ func (r *Registry) drainQueuedRequestsForModelsWithReason(models []string, reaso
 			// enqueue-time ceiling.
 			if !req.Pending.RefreshFirstContentBudget(time.Now()) {
 				req.failWithReason(ErrQueueFirstContentDeadline)
+				continue
+			}
+			// A waiter at least as demanding as one this pass already rejected
+			// purely on capacity/TTFT gets the same verdict from the same fleet
+			// state; requeue it without paying for another full fleet scan.
+			if drainDominated(req.Pending, rejected) {
+				saturated = true
+				skipped = append(skipped, req)
 				continue
 			}
 			provider, decision := r.ReserveProviderEx(model, req.Pending)
@@ -3216,9 +3231,14 @@ func (r *Registry) drainQueuedRequestsForModelsWithReason(models []string, reaso
 					req.failWithReason(ErrQueueTTFTTooSlow)
 					continue
 				}
+				if rec, ok := drainRejectionRecordFor(req.Pending, decision); ok {
+					rejected = append(rejected, rec)
+				}
+				saturated = saturated || drainPureCapacityRejection(decision)
 				skipped = append(skipped, req)
 				continue
 			}
+			admitted++
 			req.DrainTrigger = reason
 			req.Decision = decision
 			requeueSkipped()
@@ -3244,6 +3264,15 @@ func (r *Registry) drainQueuedRequestsForModelsWithReason(models []string, reaso
 				req.rejectAssignment()
 				continue
 			}
+		}
+		// Heartbeat-triggered passes are suppressed for a short window after
+		// a saturated pass (queue_drain_suppress.go); an admission proves
+		// capacity moved and lifts the mark.
+		switch {
+		case admitted > 0:
+			r.drainSuppress.clear(model)
+		case saturated:
+			r.drainSuppress.markSaturated(model)
 		}
 	}
 }
