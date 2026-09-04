@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -65,5 +66,75 @@ func TestDelayedTrailingPlanPreservesNewWindowHeartbeat(t *testing.T) {
 	}
 	if reg.swapPlanGate.planRuns() != 3 || reg.swapPlanGate.trailingArmed() {
 		t.Fatal("trailing callback did not finish the third plan")
+	}
+}
+
+// Hold an actual warm queue drain past the swap window. The remaining cold
+// demand must trigger its reload as soon as Heartbeat finishes that drain,
+// rather than scheduling a second delay from the stale heartbeat timestamp.
+func TestHeartbeatSwapPlanClaimsAfterSlowQueueDrain(t *testing.T) {
+	reg := New(testLogger())
+	const cold, warm = "swap-post-drain-cold", "swap-post-drain-warm"
+	reg.SetModelCatalog([]CatalogEntry{
+		{ID: cold, SizeGB: 8, MinRAMGB: 16}, {ID: warm, SizeGB: 8, MinRAMGB: 16},
+	})
+	coldProvider := makeSchedulerProvider(t, reg, "post-drain-cold", cold, 100)
+	warmProvider := makeSchedulerProvider(t, reg, "post-drain-warm", warm, 100)
+	reg.Heartbeat(coldProvider.ID, swapTestCrashedHeartbeat(cold, 32))
+	loads := make(chan string, 4)
+	reg.loadModelSender = func(providerID, model string) error {
+		loads <- providerID + "/" + model
+		return nil
+	}
+	stub := installTrailingTimerStub(reg)
+	for _, req := range []*QueuedRequest{swapTestQueued("post-drain-cold-request", cold), swapTestQueued("post-drain-warm-request", warm)} {
+		if err := reg.Queue().Enqueue(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	draining, release := make(chan struct{}), make(chan struct{})
+	releaseDrain := sync.OnceFunc(func() { close(release) })
+	defer releaseDrain()
+	reg.reservationAfterScan = func(model string) {
+		if model == warm {
+			close(draining)
+			<-release
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		reg.Heartbeat(warmProvider.ID, swapTestHeartbeat(warm, "running"))
+		close(done)
+	}()
+	select {
+	case <-draining:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not enter the queued warm request's drain")
+	}
+	warmProvider.mu.Lock()
+	heartbeatAt := warmProvider.LastHeartbeat
+	warmProvider.mu.Unlock()
+	if ok, _ := reg.swapPlanGate.claim(heartbeatAt); !ok {
+		t.Fatal("precondition: another plan opens a window at the heartbeat timestamp")
+	}
+	if remaining := time.Until(heartbeatAt.Add(modelSwapPlanInterval + time.Millisecond)); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	releaseDrain()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not finish after releasing the drain")
+	}
+	if len(stub.fire) != 0 {
+		t.Fatal("heartbeat added a trailing delay although the planning window already elapsed")
+	}
+	select {
+	case got := <-loads:
+		if want := coldProvider.ID + "/" + cold; got != want {
+			t.Fatalf("load = %s, want %s", got, want)
+		}
+	default:
+		t.Fatal("elapsed planning window did not immediately reload the queued cold model")
 	}
 }
