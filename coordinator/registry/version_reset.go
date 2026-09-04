@@ -39,6 +39,19 @@ import "time"
 // strikes they mark: RecordInferenceError slides them out of the breaker
 // window with the strikes and RecordInferenceSuccess drops them with the
 // history, so an identity that never changes version cannot accumulate them.
+//
+// The flush strikes are recorded by the request goroutines that drain the
+// flushed ErrorCh, not by Disconnect itself, so they can land AFTER the reset:
+// registration evicts a same-serial predecessor (DisconnectDuplicatesBySerial)
+// and stores the new version on the same goroutine, and a slow consumer can
+// trail a normal reconnect. A reset that ran first cleared nothing, consumed
+// the interval, and the late strikes would then quarantine the NEW binary for
+// the old one's death. IsSupersededDisconnectFlush closes that order: a 502
+// attributed to a session that was dropped at or before its identity's last
+// reset (disconnectedStableIDs dates every drop) is discarded under each
+// tracker mutation lock, with an API-side early return as an optimization — exactly the
+// strikes the reset would have removed, and none from a session that died
+// after it (same-version churn and a throttled version change keep striking).
 
 // disconnectFlushStatusCode is the status the pending-request flush injects
 // (registry.disconnectWithCause) and the marker the fault windows tag.
@@ -71,6 +84,41 @@ func (p *Provider) SetVersion(version string) {
 	if stableID := r.faultKeyBySession[id]; stableID != "" {
 		r.noteIdentityVersionLocked(stableID, version)
 	}
+}
+
+// IsSupersededDisconnectFlush reports whether a disconnect-flush strike
+// (statusCode 502) attributed to sessionID comes from a session that was
+// dropped at or before its stable identity's most recent version-changed
+// reset — a strike the reset would have removed had the consumer recorded it
+// first. The api layer discards such a strike before it reaches any tracker.
+// Anything else — a live session, a session the registry never dated (no
+// stable identity at disconnect), an identity that has never reset, or a drop
+// that happened after the last reset — is not superseded and records as usual,
+// which keeps the once-per-interval throttle intact: a throttled version
+// change stamps no new reset, so the strikes of the session that died after
+// the consumed reset still land.
+func (r *Registry) IsSupersededDisconnectFlush(sessionID string, statusCode int) bool {
+	if statusCode != disconnectFlushStatusCode || sessionID == "" {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.supersededDisconnectFlushLocked(sessionID)
+}
+
+// supersededDisconnectFlushLocked is IsSupersededDisconnectFlush's check under
+// r.mu (either mode): read-only against disconnectedStableIDs and
+// identityVersionResetAt.
+func (r *Registry) supersededDisconnectFlushLocked(sessionID string) bool {
+	if _, live := r.providers[sessionID]; live {
+		return false
+	}
+	c, ok := r.disconnectedStableIDs[sessionID]
+	if !ok || c.id == "" {
+		return false
+	}
+	resetAt, ok := r.identityVersionResetAt[c.id]
+	return ok && !resetAt.Before(c.at)
 }
 
 // noteIdentityVersionLocked records the binary version now running under a

@@ -62,14 +62,9 @@ func providerVersionTag(p *registry.Provider) string {
 	return sanitizeVersionTag(version)
 }
 
-// sanitizeVersionTag canonicalises a provider-reported version to a bounded
-// tag vocabulary: a release version — strict MAJOR.MINOR.PATCH, optionally with
-// a known prerelease "-(alpha|beta|rc).N", leading "v" dropped — is kept as
-// its canonical string, the empty string is "unknown" (the provider reported
-// no version), and everything else is "other". The tag rides every MLX
-// heartbeat histogram and unknown-frame counter, so a provider-controlled
-// string that merely passed a character check could mint one Datadog series
-// per reconnect; only values a real release could carry get their own.
+// sanitizeVersionTag maps strict semver to a fixed release-family vocabulary.
+// Patch versions and arbitrary numeric prereleases cannot mint new series.
+// Exact binary versions remain available in provider metadata and logs.
 func sanitizeVersionTag(version string) string {
 	version = strings.TrimSpace(version)
 	if version == "" {
@@ -94,8 +89,20 @@ func sanitizeVersionTag(version string) string {
 		if !ok || !versionTagPrereleaseKinds[kind] || !versionTagNumeric(n) {
 			return "other"
 		}
+		return "prerelease"
 	}
-	return version
+	switch segs[0] + "." + segs[1] {
+	case "0.6":
+		return "0.6.x"
+	case "0.7":
+		return "0.7.x"
+	case "0.8":
+		return "0.8.x"
+	case "0.9":
+		return "0.9.x"
+	default:
+		return "other_release"
+	}
 }
 
 // versionTagNumeric reports whether s is a semver numeric identifier: one or

@@ -69,9 +69,7 @@ func (s *Server) emitClientGone(model string, promptTokens int, chipFamily, phas
 // (see deadlineBucket), which separates "the upstream timed out on us" from an
 // early application abort. deadlineBucket is normalized to "unknown" when empty.
 func (s *Server) emitClientGoneBucketed(model string, promptTokens int, chipFamily, phase, deadlineBucket string) {
-	if chipFamily == "" {
-		chipFamily = "unknown"
-	}
+	chipFamily = sanitizeChipFamilyTag(chipFamily)
 	if deadlineBucket == "" {
 		deadlineBucket = deadlineBucketUnknown
 	}

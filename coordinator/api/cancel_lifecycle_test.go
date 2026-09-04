@@ -263,3 +263,55 @@ func TestUnknownTerminalPathsOnBareServer(t *testing.T) {
 		})
 	}
 }
+
+func TestCancelLatencyUsesFirstSuccessfulSend(t *testing.T) {
+	collector := newUDPCollector(t)
+	defer collector.Close()
+	dd := newTestDD(t, collector)
+	defer dd.Close()
+	srv := &Server{dd: dd, zombieCanceller: newZombieStreamCanceller()}
+	t0 := time.Now()
+	for _, terminal := range []string{cancelTerminalComplete, cancelTerminalStrayChunk} {
+		id := "delayed-" + terminal
+		srv.zombieCanceller.record(id, "m", cancelCauseClientGonePost, t0)
+		srv.zombieCanceller.noteSendFailed(id, t0)
+		srv.zombieCanceller.markSent(id, t0.Add(10*time.Second))
+		// A later resend must not move the latency anchor.
+		srv.zombieCanceller.markSent(id, t0.Add(11*time.Second))
+		if terminal == cancelTerminalComplete {
+			srv.resolveCancelledTerminal(id, terminal, cancelledOutcomeCompletePartial, t0.Add(12*time.Second))
+		} else {
+			srv.zombieCanceller.strayChunk(id, t0.Add(12*time.Second))
+			e, _ := srv.zombieCanceller.terminal(id)
+			srv.emitExpiredCancelEntries([]zombieEntry{e})
+		}
+		_ = dd.Statsd.Flush()
+		packets := collector.drain()
+		got := requireMetricWithTags(t, packets, metricCancelToTerminalMs, "terminal:"+terminal)
+		if len(got) != 1 || !strings.Contains(got[0], metricCancelToTerminalMs+":2000|h") {
+			t.Fatalf("latency must exclude the failed-send delay: %v", got)
+		}
+	}
+}
+
+func TestExpiredUndeliveredCancelIsUnresolved(t *testing.T) {
+	collector := newUDPCollector(t)
+	defer collector.Close()
+	dd := newTestDD(t, collector)
+	defer dd.Close()
+	srv := &Server{dd: dd, zombieCanceller: newZombieStreamCanceller()}
+	t0 := time.Now()
+	// The failed retry sees a stray chunk, but still delivers no cancel.
+	srv.zombieCanceller.record("unsent", "m", cancelCauseClientGonePre, t0)
+	srv.zombieCanceller.noteSendFailed("unsent", t0)
+	srv.zombieCanceller.strayChunk("unsent", t0.Add(time.Second))
+	srv.zombieCanceller.noteSendFailed("unsent", t0.Add(time.Second))
+	e, _ := srv.zombieCanceller.terminal("unsent")
+	srv.emitExpiredCancelEntries([]zombieEntry{e})
+	_ = dd.Statsd.Flush()
+	packets := collector.drain()
+	if got := findMetrics(packets, metricCancelToTerminalMs); len(got) != 0 {
+		t.Fatalf("undelivered cancel must not contribute latency: %v", got)
+	}
+	requireMetricWithTags(t, packets, metricCancelUnresolved, "cause:"+cancelCauseClientGonePre)
+}

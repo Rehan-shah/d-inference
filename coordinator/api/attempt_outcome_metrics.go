@@ -34,7 +34,7 @@ import (
 //     amplification denominator with attempts no provider ever received.
 //
 //   - inference.request_outcome_or_view{model,class} — the number OpenRouter
-//     actually computes. It keeps request_outcome's classes and adds the two
+//     is intended to estimate. It keeps request_outcome's classes and adds the two
 //     failure kinds request_outcome cannot see: a client that left before the
 //     first token AT or PAST the upstream first-content budget (OpenRouter's
 //     504) is a `timeout`, and a stream that failed after commit is

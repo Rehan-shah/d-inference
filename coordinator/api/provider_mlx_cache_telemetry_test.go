@@ -49,7 +49,7 @@ func assertBoundedTags(t *testing.T, packets []string) {
 				t.Fatalf("UUID-shaped tag value emitted: %s", p)
 			}
 		}
-		if !containsTag(p, "chip_family:M3") || !containsTag(p, "provider_version:0.8.20") {
+		if !containsTag(p, "chip_family:M3") || !containsTag(p, "provider_version:0.8.x") {
 			t.Fatalf("bounded tags missing: %s", p)
 		}
 	}
@@ -192,7 +192,7 @@ func TestMLXCacheTelemetryFleetCardinalityIsBounded(t *testing.T) {
 	}
 
 	families := []string{"M3", "M4"}
-	versions := []string{"0.8.20", "0.8.21"}
+	versions := []string{"0.8.20", "0.9.1"}
 	const sessions = 40
 	for i := 0; i < sessions; i++ {
 		p := newMLXTelemetryProvider(t, reg, uuid.New().String(), families[i%2], versions[(i/2)%2])
@@ -235,14 +235,15 @@ func TestSanitizeChipFamilyTag(t *testing.T) {
 	cases := map[string]string{
 		"":                                      "unknown",
 		"  ":                                    "unknown",
+		"Unknown":                               "unknown",
 		"M3":                                    "M3",
 		" M4 Pro ":                              "M4_Pro",
-		"m5":                                    "m5",
-		"M3;drop":                               "invalid",
-		"M3,env:prod":                           "invalid",
-		"Apple-M3":                              "invalid",
-		"family-that-is-way-too-long-for-a-tag": "invalid",
-		fmt.Sprintf("%017d", 0):                 "invalid",
+		"m5":                                    "other",
+		"M3;drop":                               "other",
+		"M3,env:prod":                           "other",
+		"Apple-M3":                              "other",
+		"family-that-is-way-too-long-for-a-tag": "other",
+		fmt.Sprintf("%017d", 0):                 "other",
 	}
 	for in, want := range cases {
 		if got := sanitizeChipFamilyTag(in); got != want {

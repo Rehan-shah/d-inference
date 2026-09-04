@@ -2366,7 +2366,10 @@ type Registry struct {
 	// keyed by its (now-removed) session id, so the pending-request ErrorCh flush —
 	// which runs AFTER Disconnect deletes the provider and carries the 502 "provider
 	// disconnected" faults that define a reconnecting zombie — can still resolve the
-	// identity and record those faults against the stable-identity breaker.
+	// identity and record those faults against the stable-identity breaker. The
+	// entry also dates the drop: a flush strike from a session dropped at or
+	// before the identity's last version-changed reset is discarded as already
+	// accounted for (version_reset.go, IsSupersededDisconnectFlush).
 	disconnectedStableIDs map[string]disconnectedStableID
 	// faultKeyBySession maps a LIVE session id to its stable identity
 	// (serial/SE-key/account). Bound by SetAttestationResult, removed on

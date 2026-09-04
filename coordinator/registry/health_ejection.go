@@ -487,6 +487,36 @@ func (r *Registry) RecordProviderServeOutcome(stableID string, ok bool, statusCo
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.recordProviderServeOutcomeLocked(stableID, ok, statusCode, errStr)
+}
+
+// RecordProviderSessionServeOutcome retains the source session through the
+// ejection mutation so a version reset cannot be followed by an old flush strike.
+func (r *Registry) RecordProviderSessionServeOutcome(sessionID string, ok bool, statusCode int, errStr string) (ejected, recovered bool) {
+	if sessionID == "" || !healthEjectionEnabled() {
+		return false, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !ok && statusCode == disconnectFlushStatusCode && r.supersededDisconnectFlushLocked(sessionID) {
+		return false, false
+	}
+	stableID := ""
+	if p := r.providers[sessionID]; p != nil {
+		p.mu.Lock()
+		stableID = stableProviderIdentityLocked(p)
+		p.mu.Unlock()
+	} else if cached, exists := r.disconnectedStableIDs[sessionID]; exists && time.Since(cached.at) < disconnectedStableIDTTL {
+		stableID = cached.id
+	}
+	if stableID == "" {
+		return false, false
+	}
+	return r.recordProviderServeOutcomeLocked(stableID, ok, statusCode, errStr)
+}
+
+// recordProviderServeOutcomeLocked requires r.mu and a nonempty stable identity.
+func (r *Registry) recordProviderServeOutcomeLocked(stableID string, ok bool, statusCode int, errStr string) (ejected, recovered bool) {
 	now := time.Now()
 	r.healthEjectionSweepLocked(now)
 

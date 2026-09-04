@@ -82,7 +82,7 @@ func (s *Server) sendRecordedCancel(provider *registry.Provider, requestID, mode
 		s.zombieCanceller.noteSendFailed(requestID, now)
 		return
 	}
-	s.zombieCanceller.markSent(requestID, now)
+	s.zombieCanceller.markSent(requestID, time.Now())
 	s.ddIncr(metricCancelSent, []string{"cause:" + cause, "model:" + modelTag(model)})
 }
 
@@ -130,7 +130,7 @@ func (s *Server) noteStrayChunk(provider *registry.Provider, providerID, request
 		s.zombieCanceller.noteSendFailed(requestID, now)
 		return
 	}
-	resendIndex := s.zombieCanceller.markSent(requestID, now)
+	resendIndex := s.zombieCanceller.markSent(requestID, time.Now())
 	if resendIndex < 0 {
 		// Untracked (zero-value Server): the frame went out, nothing to count.
 		return
@@ -159,7 +159,7 @@ func (s *Server) resolveCancelledTerminal(requestID, terminal, outcome string, n
 	}
 	delivered := e.sent > 0
 	if delivered {
-		s.ddHistogram(metricCancelToTerminalMs, cancelLatencyMs(now.Sub(e.firstCancelAt)),
+		s.ddHistogram(metricCancelToTerminalMs, cancelLatencyMs(now.Sub(e.firstSentAt)),
 			[]string{"terminal:" + terminal, "model:" + modelTag(e.model), "cause:" + e.cause})
 	}
 	s.ddIncr(metricCancelledTerminal, []string{"outcome:" + outcome, "cause:" + e.cause,
@@ -181,14 +181,15 @@ func cancelledErrorOutcome(msg *protocol.InferenceErrorMessage) string {
 }
 
 // emitExpiredCancelEntries reports cancels that never got a terminal. One
-// that produced stray chunks contributes its last chunk as the terminal
-// (terminal:stray_chunk); one that produced nothing is counted unresolved —
+// that delivered a cancel and produced subsequent stray chunks contributes
+// its last chunk as the terminal (terminal:stray_chunk). Every other entry
+// is counted unresolved —
 // the provider honored the cancel silently, disconnected, or never saw it.
 func (s *Server) emitExpiredCancelEntries(expired []zombieEntry) {
 	for i := range expired {
 		e := &expired[i]
-		if !e.lastStrayAt.IsZero() {
-			s.ddHistogram(metricCancelToTerminalMs, cancelLatencyMs(e.lastStrayAt.Sub(e.firstCancelAt)),
+		if e.sent > 0 && !e.lastStrayAt.IsZero() && !e.lastStrayAt.Before(e.firstSentAt) {
+			s.ddHistogram(metricCancelToTerminalMs, cancelLatencyMs(e.lastStrayAt.Sub(e.firstSentAt)),
 				[]string{"terminal:" + cancelTerminalStrayChunk, "model:" + modelTag(e.model), "cause:" + e.cause})
 			continue
 		}

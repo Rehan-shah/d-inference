@@ -427,3 +427,110 @@ func TestMigrateFaultState_ResetTimestampKeepsLater(t *testing.T) {
 		})
 	}
 }
+
+// dropAbruptlyUnrecorded parks a request on the session and drops it without a
+// close frame, leaving the flush 502 in the consumer's ErrorCh UNRECORDED —
+// the state registration's duplicate-serial eviction leaves the old session
+// in while it goes on to store the new version.
+func dropAbruptlyUnrecorded(t *testing.T, r *Registry, id string) {
+	t.Helper()
+	p := r.GetProvider(id)
+	if p == nil {
+		t.Fatalf("provider %s not registered", id)
+	}
+	p.AddPending(&PendingRequest{
+		RequestID: id + "-req",
+		Model:     "m",
+		ErrorCh:   make(chan protocol.InferenceErrorMessage, 1),
+	})
+	r.DisconnectWithReason(id, DisconnectReasonReadError)
+}
+
+// The predicate behind the api-side discard of late flush strikes: a 502 from
+// a session dropped at or before its identity's last version-changed reset is
+// superseded; a live session, a non-flush status, an identity that never
+// reset, and a session dropped after the reset (including under a THROTTLED
+// version change, which stamps no new reset) are not.
+func TestSupersededDisconnectFlush_DatesTheDropAgainstTheReset(t *testing.T) {
+	r := New(testLogger())
+	bindVersionedSession(t, r, "s1", "0.9.0", true)
+	dropAbruptlyUnrecorded(t, r, "s1")
+	if r.IsSupersededDisconnectFlush("s1", 502) {
+		t.Fatal("no reset has run: the flush strike must record")
+	}
+
+	// Registration order: the eviction above already happened when SetVersion
+	// runs the reset against empty windows.
+	bindVersionedSession(t, r, "s2", "0.9.1", false)
+	if !r.IsSupersededDisconnectFlush("s1", 502) {
+		t.Fatal("s1 was dropped before the version reset: its flush strike is superseded")
+	}
+	if r.IsSupersededDisconnectFlush("s1", 500) {
+		t.Fatal("only the disconnect-flush status is superseded, never a genuine fault")
+	}
+	if r.IsSupersededDisconnectFlush("s2", 502) {
+		t.Fatal("a live session is never superseded")
+	}
+	if r.IsSupersededDisconnectFlush("nobody", 502) {
+		t.Fatal("an unknown session is never superseded")
+	}
+
+	// The new binary dies too, and a THIRD version arrives inside the reset
+	// interval: throttled, so no new reset is stamped and s2's flush strikes
+	// (dropped after the only reset) must still land.
+	dropAbruptlyUnrecorded(t, r, "s2")
+	bindVersionedSession(t, r, "s3", "0.9.2", false)
+	if r.IsSupersededDisconnectFlush("s2", 502) {
+		t.Fatal("s2 was dropped after the last reset (the next one was throttled): its flush strike must record")
+	}
+	if !r.IsSupersededDisconnectFlush("s1", 502) {
+		t.Fatal("s1's verdict does not change with later sessions")
+	}
+}
+
+// No stable identity at disconnect → the registry never dated the drop and
+// the strike keys by the session id anyway: not superseded.
+func TestSupersededDisconnectFlush_UnattestedSessionIsNotDated(t *testing.T) {
+	r := New(testLogger())
+	msg := testRegisterMessage()
+	msg.Models = []protocol.ModelInfo{{ID: "m", ModelType: "chat"}}
+	p := r.Register("anon", nil, msg)
+	p.SetVersion("0.9.0")
+	dropAbruptlyUnrecorded(t, r, "anon")
+	if r.IsSupersededDisconnectFlush("anon", 502) {
+		t.Fatal("a session without a stable identity is never superseded")
+	}
+}
+
+// A reset can occur after the API precheck or between any pair of tracker
+// writes. Every write retains the session id and checks inside its mutation
+// lock; earlier writes are removed by the reset and later ones are discarded.
+func TestVersionResetInterleavedWithTrackerWrites(t *testing.T) {
+	for split := 0; split <= 3; split++ {
+		t.Run(fmt.Sprintf("reset_after_%d_trackers", split), func(t *testing.T) {
+			r := New(testLogger())
+			bindVersionedSession(t, r, "old", "0.9.0", true)
+			dropAbruptlyUnrecorded(t, r, "old")
+			if r.IsSupersededDisconnectFlush("old", 502) {
+				t.Fatal("API precheck before the reset must allow the old flush")
+			}
+			writes := []func(){
+				func() { r.RecordInferenceError("old", "m", 502, "base") },
+				func() { r.RecordProviderOutcome("old", false, 502, "provider disconnected") },
+				func() { r.RecordProviderSessionServeOutcome("old", false, 502, "provider disconnected") },
+			}
+			for _, write := range writes[:split] {
+				for range 8 {
+					write()
+				}
+			}
+			bindVersionedSession(t, r, "new", "0.9.1", false)
+			for _, write := range writes[split:] {
+				for range 8 {
+					write()
+				}
+			}
+			assertIdentityQuarantine(t, r, "new", false)
+		})
+	}
+}

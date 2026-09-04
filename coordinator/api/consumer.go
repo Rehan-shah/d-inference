@@ -447,6 +447,16 @@ func (s *Server) noteInferenceError(providerID string, pr *registry.PendingReque
 		}
 		return
 	}
+	// Late disconnect-flush strike (registry/version_reset.go): the session this
+	// 502 was flushed from was dropped at or before its identity's version-
+	// changed reset, so the reset already accounted for it. The flush is
+	// recorded HERE, by the request goroutine, not by Disconnect — and
+	// registration evicts a same-serial predecessor and stores the new version
+	// on one goroutine, ahead of these consumers — so without the check the
+	// new binary would be quarantined for the old one's death.
+	if s.registry.IsSupersededDisconnectFlush(providerID, statusCode) {
+		return
+	}
 	if s.registry.RecordInferenceError(providerID, pr.Model, statusCode, pr.Traits.CooldownShape()) {
 		s.ddIncr("routing.cooldown_entered", []string{"model:" + pr.Model})
 	}
@@ -460,10 +470,8 @@ func (s *Server) noteInferenceError(providerID string, pr *registry.PendingReque
 	}
 	// Feed the STABLE-IDENTITY ejection breaker too (survives reconnect churn, so a
 	// zombie that fault-loops while constantly disconnecting still accumulates).
-	if sid := s.registry.GetProviderStableIdentity(providerID); sid != "" {
-		if ejected, _ := s.registry.RecordProviderServeOutcome(sid, false, statusCode, errStr); ejected {
-			s.ddIncr("routing.provider_ejected", []string{"model:" + pr.Model})
-		}
+	if ejected, _ := s.registry.RecordProviderSessionServeOutcome(providerID, false, statusCode, errStr); ejected {
+		s.ddIncr("routing.provider_ejected", []string{"model:" + pr.Model})
 	}
 	// Feed the capacity-reject cooldown. Capacity-class rejections are
 	// DELIBERATELY invisible to reputation and to ALL the breakers above (a

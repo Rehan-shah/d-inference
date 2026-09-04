@@ -62,9 +62,11 @@ var zombieResendSchedule = []time.Duration{time.Second, 3 * time.Second, 10 * ti
 type zombieEntry struct {
 	model string
 	cause string
-	// firstCancelAt anchors the re-send schedule and cancel→terminal latency.
+	// firstCancelAt anchors tracking expiry and the re-send schedule.
 	firstCancelAt time.Time
-	lastSentAt    time.Time
+	// firstSentAt anchors latency only after the first successful enqueue.
+	firstSentAt time.Time
+	lastSentAt  time.Time
 	// lastStrayAt is the last chunk seen for the request after it was
 	// abandoned (zero if none): the last evidence of generation.
 	lastStrayAt  time.Time
@@ -93,6 +95,9 @@ func (e *zombieEntry) lastActivity() time.Time {
 // the very first send), and arms the next re-send instant.
 func (e *zombieEntry) markSent(now time.Time) (resendIndex int) {
 	resendIndex = min(e.sent, zombieResendIndexMax)
+	if e.sent == 0 {
+		e.firstSentAt = now
+	}
 	e.sent++
 	e.lastSentAt = now
 	for e.scheduleIdx < len(zombieResendSchedule) {

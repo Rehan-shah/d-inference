@@ -1,6 +1,6 @@
 # PR body — coordinator performance program, PR C/D: 2026-09-02 wave fixes (2026-09-03)
 
-> Last updated: 2026-09-04 · commit `7e32e5eca`
+> Last updated: 2026-09-04 · commit `aa87a0ebd`
 
 Branch `perf/coordinator-wave-fixes-2026-09-03`.
 **Base: `perf/coordinator-tier2-base-2026-09-03` (PR A + PR B); retarget to master after PR #820 and PR #819 merge; Retry-After policy left for the owner.**
@@ -92,7 +92,7 @@ flowchart LR
 | `registry/scan_arena.go`, `model_index.go`, `tps_registry.go`, `solo_tps.go`, `pooled_budget_memo.go`, `ttft_shadow.go` scan hunks, `scan_bench_test.go`, `tps_registry_memo_test.go`, `pooled_budget_memo_test.go`, `scan_arena_test.go`, `model_index_test.go`; all `*KeyLocked` fault-map variants; `dispatchLoadCooldowns` struct-key change; w2 test edits to `alias_test.go`, `helpers_shared_test.go`, `provider_capabilities_test.go`, `scheduler_queue_drain_test.go`, `stable_fault_key_test.go` | Excluded | Duplicates of PR B (one implementation lands). |
 | `api/telemetry_sink.go` four-lane rewrite, keyed `submitTelemetry`, `telemetry_sink_test.go` | Excluded | Duplicate of PR A's batched route sink. |
 | `registry/budget_clamp.go`, `capacity_cooldown.go`, `capacity_rate.go`, `dispatch_plan.go`, `servability_gate.go`, `settlement.go`, `route_outcome.go` (beyond the drain/metric hunks above), `request_introspection.go`, `server.go` (beyond the gauge wiring) | Excluded | Not needed by any ported item. |
-| `deploy/datadog/dev-network-dashboard.json`, `docs/architecture/operations/scheduling.md`, `docs/architecture/request-outcome-observability.md`, `docs/reference/protocol-messages.md` | Excluded | The dashboard widgets reference unported series (eligibility, Retry-After); doc updates are the owner's call once the series set is final. |
+| `deploy/datadog/dev-network-dashboard.json`, `docs/architecture/operations/scheduling.md`, `docs/architecture/request-outcome-observability.md` | Excluded | The dashboard widgets reference unported series (eligibility, Retry-After); the excluded dashboard and broad observability doc changes reference unported series. The canonical protocol reference is updated with the shipped drain markers. |
 
 ## Semantics deltas against #809 / PR A (intentional, documented here)
 
@@ -136,7 +136,7 @@ Per commit: `gofmt -l .`, `go build ./...`, `go vet ./...`, `golangci-lint v2.1.
 - Queue drain: one pass runs per model at a time (`registry/queue_drain_coalesce.go`). A trigger that lands while a pass holds popped waiters — heartbeat, `SetProviderIdle`, challenge recovery, disconnect — no longer scans an empty queue; it makes the running pass go around once more with fresh fleet state and empty dominance records, attributed to that trigger. Closes the interleaving where a mid-pass capacity change left dominance-skipped waiters requeued on a stale verdict until the next trigger. Pinned by `TestDrainTriggerMidPassRerunsHeldWaiters` through a nil-in-production `drainBeforePop` seam.
 - Drain mark ownership removed: a provider's idle/serving heartbeat clears a typed-rejection-set mark too. The typed reason and the heartbeat status ship in the same provider binary (released 0.8.16 sends neither), so no provider types the reason without reporting the status, while the rejection-first ordering is real (the drain announcement is a detached task, dropped while the session is not registered). An aborted update drain is back in routing on its next heartbeat instead of after the 150 s TTL, which stays as the heartbeat-loss fallback. `TestMarkDraining_ClearedByIdleHeartbeat_OrTTL`, `TestDrain_TypedRejectionClearedByIdleHeartbeat` (inverted from the previous round).
 - Version-reset throttle follows an identity rebind: `migrateFaultStateLocked` now moves `identityVersionResetAt` with `identityVersions` (later timestamp wins), so a `sekey:` → `serial:` rebind cannot hand the identity a second flush-strike reset inside the 10-minute interval. `TestVersionResetThrottle_FollowsIdentityRebind`, `TestMigrateFaultState_ResetTimestampKeepsLater`.
-- `provider_version` tag cardinality: `sanitizeVersionTag` canonicalises to release-shaped values — strict `MAJOR.MINOR.PATCH`, optional `-(alpha|beta|rc).N`, leading `v` dropped — with the empty string as `unknown` and everything else as `other` (the previous `invalid` bucket is gone). Covers `inference.unknown_frames` and the MLX cache histograms.
+- `provider_version` tag cardinality: `sanitizeVersionTag` validates strict semver and maps it to the fixed vocabulary `0.6.x`, `0.7.x`, `0.8.x`, `0.9.x`, `other_release`, `prerelease`, `unknown`, or `other`. Exact versions remain in provider metadata; arbitrary patch numbers and prerelease counters do not create new series. Covers `inference.unknown_frames` and the MLX cache histograms.
 - Swift heartbeat encode-failure fallback carries the computed status (`draining`/`serving`/`idle`) instead of a literal `idle`; `UpdateDrainAwarenessTests` forces the path with a NaN capacity payload.
 - `inference.attempt_outcome`: a typed `draining` refusal (chat `provider_error`, generic `provider_error_before_response`) is `class:capacity`, not `fault` — `isCapacityClassErrorReason` now lists `draining`, matching the health-neutral treatment the same terminal already gets everywhere else. Mapping cases added.
 - Cancel lifecycle telemetry counts delivery, not intent: `sendRecordedCancel` and the stray-chunk re-send hand the frame to the provider writer first and mark/count `inference.cancel_sent` only when the enqueue succeeded; a refused enqueue (control lane full, writer stopped) keeps the entry unsent for the next stray-chunk retry, and the first cancel that reaches a writer counts once under the abandon cause. `inference.cancelled_terminal` gains a bounded `delivered:true|false` tag and `inference.cancel_to_terminal_ms` is sampled only for delivered cancels. `TestCancelSendCountsOnlyDeliveredFrames`; the socketless racer fixture now expects no `cancel_sent`.
@@ -147,3 +147,18 @@ Per commit: `gofmt -l .`, `go build ./...`, `go vet ./...`, `golangci-lint v2.1.
 - Nothing under `store/`, `chat_stream_relay.go`, `stream_coalesce.go`, `generic_endpoint_stream.go`, `telemetry_sink.go`, `model_index.go`, `tps_registry.go` or `solo_tps.go` changes.
 - The fault-tracker files Tier 3 is restructuring (`capacity_cooldown.go` untouched; `error_cooldown.go` +5, `health_ejection.go` +27/−3, `provider_breaker.go` +11/−1) carry behaviour-only hunks: a flush flag on the health-window outcome and the flush-strike tag on the inference-error strike.
 - Retry-After is deliberately untouched everywhere (#799's `estimateRetryAfter` / `estimateTTFTRetryAfter` stay).
+
+## Final review corrections (2026-09-04)
+
+- Late disconnect-flush suppression is checked inside each tracker mutation lock.
+  The session-aware health-ejection entrypoint preserves source identity through
+  the write, so a reconnect reset cannot race an API-side precheck and reopen
+  quarantine. Regression coverage inserts the reset before or between all three
+  tracker updates, alongside same-version and throttled-reset controls.
+- Both MLX and client-gone chip tags use one fixed vocabulary. Version tags use
+  fixed release-family buckets; patch and prerelease rotation cannot create series.
+- Cancel latency begins at the first successful enqueue, never at a failed
+  initial attempt. An expired unsent cancel is unresolved even when stray chunks
+  arrived; only chunks at or after the first successful send contribute latency.
+- Canonical protocol, scheduling, telemetry and outcome references now describe
+  the wire markers, queue coalescing, reset ordering and metric semantics.

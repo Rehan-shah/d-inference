@@ -2,7 +2,6 @@ package api
 
 import (
 	"math"
-	"strings"
 
 	"github.com/eigeninference/d-inference/coordinator/protocol"
 	"github.com/eigeninference/d-inference/coordinator/registry"
@@ -85,30 +84,4 @@ func mlxTelemetryTags(provider *registry.Provider) []string {
 		"chip_family:" + sanitizeChipFamilyTag(providerChipFamily(provider)),
 		"provider_version:" + providerVersionTag(provider),
 	}
-}
-
-// maxChipFamilyTagLen bounds the chip_family tag: real values are short
-// ("M3", "M4 Pro"); anything longer is treated as untrusted input.
-const maxChipFamilyTagLen = 16
-
-// sanitizeChipFamilyTag keeps a chip family only when it is short and made of
-// letters, digits, and single spaces; empty → "unknown", anything else →
-// "invalid".
-func sanitizeChipFamilyTag(family string) string {
-	family = strings.TrimSpace(family)
-	if family == "" {
-		return "unknown"
-	}
-	if len(family) > maxChipFamilyTagLen {
-		return "invalid"
-	}
-	for i := 0; i < len(family); i++ {
-		c := family[i]
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == ' ':
-		default:
-			return "invalid"
-		}
-	}
-	return strings.ReplaceAll(family, " ", "_")
 }

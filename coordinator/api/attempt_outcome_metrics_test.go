@@ -172,10 +172,10 @@ func TestSanitizeVersionTag(t *testing.T) {
 	cases := map[string]string{
 		"":                       "unknown",
 		"  ":                     "unknown",
-		"0.6.20":                 "0.6.20",
-		"v0.8.16":                "0.8.16",
-		"0.8.16-rc.1":            "0.8.16-rc.1",
-		"0.8.16-beta.2":          "0.8.16-beta.2",
+		"0.6.20":                 "0.6.x",
+		"v0.8.16":                "0.8.x",
+		"0.8.16-rc.1":            "prerelease",
+		"0.8.16-beta.2":          "prerelease",
 		"build-a1":               "other",
 		"0.8.16-abc123":          "other",
 		"0.8.16-rc":              "other",
@@ -473,7 +473,7 @@ func TestUnknownFrames_CountedByKindAndVersion(t *testing.T) {
 
 	key := func(kind string) string {
 		return counterKey(metricUnknownFramesCounter,
-			MetricLabel{"kind", kind}, MetricLabel{"provider_version", version})
+			MetricLabel{"kind", kind}, MetricLabel{"provider_version", "0.6.x"})
 	}
 	snap := waitForCounters(t, srv, 3*time.Second, func(s MetricsSnapshot) bool {
 		return s.Counters[key(unknownFrameKindChunk)] == 1 &&
@@ -489,7 +489,7 @@ func TestUnknownFrames_CountedByKindAndVersion(t *testing.T) {
 	_ = dd.Statsd.Flush()
 	packets := findMetrics(collector.drain(), metricUnknownFrames)
 	for _, kind := range []string{unknownFrameKindChunk, unknownFrameKindComplete, unknownFrameKindError} {
-		if got := sumMetric(t, packets, metricUnknownFrames, "kind:"+kind, "provider_version:"+version); got != 1 {
+		if got := sumMetric(t, packets, metricUnknownFrames, "kind:"+kind, "provider_version:0.6.x"); got != 1 {
 			t.Errorf("UDP unknown_frames{kind:%s} = %v, want 1; packets=%v", kind, got, packets)
 		}
 	}

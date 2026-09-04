@@ -90,6 +90,10 @@ func (r *Registry) RecordInferenceError(providerID, modelID string, statusCode i
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Recheck under the mutation lock: a version reset can race any API-side check.
+	if statusCode == disconnectFlushStatusCode && r.supersededDisconnectFlushLocked(providerID) {
+		return false
+	}
 	now := time.Now()
 	// Key by the stable fault key (serial/SE-key when bound, session id
 	// otherwise) so strikes and cooldowns survive reconnect churn.
