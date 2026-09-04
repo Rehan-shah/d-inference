@@ -103,6 +103,9 @@ func TestGateRejectionTallies(t *testing.T) {
 		// withHealthy adds a second, fully eligible provider so the breaker /
 		// ejection fail-open re-scan does not rescue the gated one.
 		withHealthy bool
+		// indexSkips: the gated provider does not advertise the model, so the
+		// indexed scan never visits it (H4); see the not_serving_model case.
+		indexSkips bool
 		// setup mutates the gated provider / registry / request; returns the
 		// excludeIDs to pass to ReserveProviderEx.
 		setup func(t *testing.T, reg *Registry, p *Provider, pr *PendingRequest) []string
@@ -228,7 +231,11 @@ func TestGateRejectionTallies(t *testing.T) {
 			pr.AllowedProviderSerials = []string{"no-such-serial"}
 			return nil
 		}},
-		{name: "not_serving_model", want: GateNotServingModel, setup: func(_ *testing.T, _ *Registry, _ *Provider, pr *PendingRequest) []string {
+		// H4 (per-model index): the indexed scan never VISITS a provider that
+		// does not advertise the model, so it reports Scanned 0 and no gate
+		// tally at all; the GateNotServingModel tally only lands on the
+		// brute-force walk (index disabled). indexSkips pins both shapes.
+		{name: "not_serving_model", want: GateNotServingModel, indexSkips: true, setup: func(_ *testing.T, _ *Registry, _ *Provider, pr *PendingRequest) []string {
 			pr.Model = ctxOtherModel
 			return nil
 		}},
@@ -248,6 +255,19 @@ func TestGateRejectionTallies(t *testing.T) {
 			pr := ctxRequest(model)
 			excludeIDs := tc.setup(t, reg, p, pr)
 			winner, d := reg.ReserveProviderEx(pr.Model, pr, excludeIDs...)
+			if tc.indexSkips {
+				// Indexed walk: the non-advertiser is pruned before any gate runs.
+				if winner != nil {
+					t.Fatalf("indexed: winner = %s, want none", winner.ID)
+				}
+				if d.Scanned != 0 || d.CandidateSetSize != 0 || sumGateRejections(d) != 0 {
+					t.Fatalf("indexed: scanned=%d set=%d rejections=%v, want 0/0/none", d.Scanned, d.CandidateSetSize, gateTallyMap(d))
+				}
+				// Brute-force walk: the legacy tally below still holds.
+				reg.modelIndexDisabled = true
+				winner, d = reg.ReserveProviderEx(pr.Model, pr, excludeIDs...)
+				reg.modelIndexDisabled = false
+			}
 			if winner != nil {
 				winner.RemovePending(pr.RequestID)
 			}
