@@ -155,5 +155,3 @@ only safe under squash-merge (master is squash-only — do not rebase-merge).
 - `go test ./registry/...` green (incl. `routing_context_test`, `fleet_sample_test`, `TestModelIndexMatchesBruteForceAfterEveryMutation`, `TestRoutingWalksIdenticalWithAndWithoutModelIndex`, `TestRoutingWalksIdenticalWithFaultStateWithAndWithoutIndex`, `TestModelIndexOffCatalogSelfRouteStillRoutes`, `reserve_bench_test`).
 - `go test ./api/` green — master's api against the new registry, unchanged.
 - Known flakes not touched: `promptcontract` supervisor test under load; `TestMDMSchedulerDuePagingCannotStarveLiveRowBehindDisconnectedPrefix` (pre-existing).
-
-Follow-on: the Tier 3 lock restructure that stacks on this branch is recorded in [`2026-09-03-perf-pr-c-tier3-body.md`](2026-09-03-perf-pr-c-tier3-body.md).
