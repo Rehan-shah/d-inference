@@ -153,7 +153,10 @@ The request-path suites run in both modes (`forEachCommitMode`).
 
 `TestRequestPathParallelSpeedup` pins the guard: ≥ 4× at 16 threads when the box's own read-only
 walk reaches 4× (an unloaded machine), otherwise the request path must parallelize at least 60% as
-well as the read-only walk (the base branch is at ≈45%). It logs both speed-ups and the load average.
+well as the read-only walk (the base branch is at ≈45%). Each quantity is the best of three
+interleaved fixed-work runs; it logs both speed-ups and the load average, and skips (numbers logged)
+when the 1-minute load exceeds 2×GOMAXPROCS, where lock-holder preemption defeats every scheme. On
+this box at load 449 it measured read-only 4.75× vs request path 3.50× (74%).
 
 ## Acceptance metrics (prod, via #809 stamps)
 
