@@ -438,6 +438,8 @@ ring or `DaemonState` mirror.
 
 ## Related
 
+- [`../reports/2026-09-03-perf-pr-b-body.md`](../reports/2026-09-03-perf-pr-b-body.md) — the routing-scan landing (per-model provider index) that changed the meaning of `scanned` above.
+
 - [`../reference/protocol-messages.md`](../reference/protocol-messages.md) — `profile` row, heartbeat `telemetry` sub-objects
 - [`request-outcome-observability.md`](request-outcome-observability.md) — `final_status`, `error_class`, `terminal_cause` vocabularies
 - [`telemetry.md`](telemetry.md) — Datadog transport, sinks, invariants shared with the rest of telemetry
