@@ -398,7 +398,7 @@ func (r *Registry) ReserveNextFromPlan(pr *PendingRequest, plan *DispatchPlan, e
 	enforceTTFT := pr.MaxTTFTMs > 0 && !pr.RequiresVision
 
 	var skips []PlanSkip
-	lock := r.commitLock()
+	lock := r.commitLock("commit_plan")
 	lock.lock()
 	defer lock.unlock()
 

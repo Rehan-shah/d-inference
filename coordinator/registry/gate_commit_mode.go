@@ -70,23 +70,25 @@ func (m reserveCommitMode) String() string {
 type commitLock struct {
 	r      *Registry
 	global bool
+	site   string
+	write  writeHold
 }
 
-func (r *Registry) commitLock() commitLock {
-	return commitLock{r: r, global: r.reserveCommitMode == reserveCommitGlobal}
+func (r *Registry) commitLock(site string) commitLock {
+	return commitLock{r: r, global: r.reserveCommitMode == reserveCommitGlobal, site: site}
 }
 
-func (l commitLock) lock() {
+func (l *commitLock) lock() {
 	if l.global {
-		l.r.mu.Lock()
+		l.write = l.r.lockWrite(l.site)
 	} else {
 		l.r.mu.RLock()
 	}
 }
 
-func (l commitLock) unlock() {
+func (l *commitLock) unlock() {
 	if l.global {
-		l.r.mu.Unlock()
+		l.write.unlock()
 	} else {
 		l.r.mu.RUnlock()
 	}

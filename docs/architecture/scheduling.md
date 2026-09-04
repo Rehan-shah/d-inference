@@ -238,8 +238,16 @@ model in rather than waiting out the queue. It has two entry points:
   which returns without planning while the queue is empty and otherwise
   admits at most one plan per `modelSwapPlanInterval` across all heartbeats
   (`modelSwapPlanGate`). The planner walks the fleet per queued model, so N
-  heartbeats inside the window would each re-derive the same plan; the
-  queue *drain* is per-heartbeat and is not coalesced.
+  heartbeats inside the window would each re-derive the same plan. A
+  heartbeat the window refuses is coalesced, not dropped: it arms one
+  trailing plan for the end of the window (`armTrailing`,
+  `trailingModelSwapPlan`), so a provider that heartbeat made loadable waits
+  at most `modelSwapPlanInterval` for the planner rather than for the next
+  heartbeat; the trailing plan claims the same gate, so the planner still
+  runs at most once per window. If a delayed timer finds that a heartbeat
+  opened a newer window, it rearms for that window to preserve any later
+  suppressed state change. The queue *drain* is per-heartbeat and is not
+  coalesced.
 - **Cold dispatch** ([`EIGENINFERENCE_COLD_DISPATCH`](../reference/configuration.md#routing-admission-and-ttft),
   `coordinator/api/cold_dispatch.go`) calls `TriggerModelSwaps` directly the
   moment a request is enqueued; that kick is immediate and not subject to
@@ -337,7 +345,8 @@ previous heartbeat when that gap is at most `maxUptimeCredit =
 2 * time.Minute`, releases satisfied budget clamps, drains the provider's
 model queues with `DrainTriggerHeartbeat`, and calls
 `triggerModelSwapsFromHeartbeat`, which runs the swap planner only when the
-queue is non-empty and at most once per `modelSwapPlanInterval` fleet-wide
+queue is non-empty and at most once per `modelSwapPlanInterval` fleet-wide,
+a heartbeat the window refuses arming one trailing plan for the window's end
 ([above](#model-slots-pending-loads-and-swaps)).
 
 The provider CLI heartbeats every
@@ -473,3 +482,16 @@ keeps `StatusUntrusted` instead. Eviction reaches `Disconnect` directly. It:
 - [`../reference/protocol-messages.md`](../reference/protocol-messages.md) — `heartbeat`, `load_model`, `BackendCapacity`.
 - [`../reference/configuration.md`](../reference/configuration.md) — coordinator environment reference.
 - [`../operations/routing-v2-rollout.md`](../operations/routing-v2-rollout.md) — kill switches for the queue, cold-dispatch and warm-pool flags.
+
+## Verification dispatcher cadence
+
+The verification scheduler is separate from inference admission. Its dispatcher
+reloads durable due rows at `mdmSchedulerDispatchInterval = time.Second` or on a
+wake with an empty queue (`coordinator/api/mdm_scheduler_exec.go`,
+`shouldLoadDueRows`). A due job blocked by occupied workers or the reserved urgent
+slot waits at most `mdmSchedulerBusyRetryDelay = 250 * time.Millisecond`; an
+earlier future job retains its shorter timer (`nextDispatchDelay`). Worker
+completion signals the dispatcher immediately. Due-row pages start at
+`min(limit, verificationDuePageHint)` with `verificationDuePageHint = 256`
+and grow to the requested limit (`coordinator/store/postgres.go`,
+`ListDueVerificationJobsPage`); the initial allocation does not truncate a page.

@@ -421,6 +421,13 @@ type RoutingDecision struct {
 	// PendingForModel / TotalPending are the winner's coordinator-side pending
 	// counts (this model / all models) at snapshot time, before this reservation.
 	PendingForModel, TotalPending int
+	// ScanCount is how many candidate scans this reservation attempt ran —
+	// one for a clean commit, more when a commit had to rescan (winner gone
+	// or full between scan and commit, cache-routing reconfiguration). Zero
+	// for a plan-based retry, which reuses the previous scan. The api layer
+	// emits it as the routing.scans counter so scan CPU per attempt is
+	// measured, not inferred from the profile.
+	ScanCount int
 	// LockWaitUS / ScanUS / AdmitUS are the three phases of ReserveProviderEx:
 	// waiting for r.mu, the candidate scan + selection (+ shadow evaluation),
 	// and the admit re-check under p.mu. Microseconds.
@@ -517,14 +524,17 @@ func (r *Registry) reserveProvider(model string, pr *PendingRequest, wantPlan bo
 	carried := RoutingDecision{Model: model}
 	var last providerReservationScan
 	var admitUS int64
+	scans := 0
 	failedDecision := func() RoutingDecision {
 		decision := routingDecisionForFailedScan(model, last.candidates)
 		addRoutingRejections(&decision, carried)
 		decision.LockWaitUS, decision.ScanUS, decision.AdmitUS = last.lockWaitUS, last.scanUS, admitUS
+		decision.ScanCount = scans
 		return decision
 	}
 	for pr.RefreshFirstContentBudget(time.Now()) {
 		last = r.scanProviderReservation(model, pr, excluded...)
+		scans++
 		if last.selected == nil {
 			return nil, failedDecision(), nil
 		}
@@ -549,6 +559,7 @@ func (r *Registry) reserveProvider(model string, pr *PendingRequest, wantPlan bo
 				model, provider, candidate, last.candidates)
 			addRoutingRejections(&decision, carried)
 			decision.LockWaitUS, decision.ScanUS, decision.AdmitUS = last.lockWaitUS, last.scanUS, admitUS
+			decision.ScanCount = scans
 			r.currentTTFTShadow(
 				model, pr, candidate, excluded...).applyTo(&decision)
 			var plan *DispatchPlan
@@ -654,7 +665,7 @@ func (r *Registry) commitProviderReservation(
 	scan providerReservationScan,
 	excludeIDs ...string,
 ) (*Provider, *routingCandidate, reservationCommitOutcome, RoutingDecision) {
-	lock := r.commitLock()
+	lock := r.commitLock("commit")
 	lock.lock()
 	defer lock.unlock()
 
@@ -1208,20 +1219,12 @@ func (r *Registry) scanCandidatesLocked(model string, pr *PendingRequest, ignore
 			// counting ejection here, ejecting EVERY provider for a model would leave
 			// winner==nil with breakerRejected==0, so shouldBypassBreakerFailOpen would
 			// NOT fire and the model would be zeroed out. Only meaningful on the normal pass.
-			g := r.gateOf(p)
-			if !ignoreProviderBreaker {
-				if g.breakerOpenAt(nowNS) {
-					breakerRejected++
-				} else if healthEjectionEnabled() {
-					// p.mu is not held here (snapshot released it); take it for the
-					// identity read (r.mu→p.mu is the established order).
-					p.mu.Lock()
-					sid := stableProviderIdentityLocked(p)
-					p.mu.Unlock()
-					if r.ejectionOpenFor(g, sid, nowNS) {
-						breakerRejected++
-					}
-				}
+			// p.mu is not held here (the snapshot released it), so the reads run on
+			// a confirmed gateView (rejectedGateClassification).
+			view := r.gateViewOf(p)
+			brokenOrEjected, cooled := r.rejectedGateClassification(&view, model, now, nowNS, ignoreProviderBreaker)
+			if brokenOrEjected {
+				breakerRejected++
 			}
 			// A pair dropped ONLY by the capacity-reject cooldown is TRANSIENT
 			// capacity, not structural absence — count it as a capacityRejection
@@ -1230,7 +1233,7 @@ func (r *Registry) scanCandidatesLocked(model string, pr *PendingRequest, ignore
 			// ignoreCapacityCooldown re-run of the shared gate keeps a pair that
 			// ALSO fails a structural gate out of the count; both checks are
 			// cheap and only run on the already-rare drop path.
-			if g.capacityCooled(model, now) {
+			if cooled {
 				p.mu.Lock()
 				otherwiseRoutable := r.providerPassesRoutingGatesLockedEx(p, model, pr.Traits, relaxTrust, now, ignoreProviderBreaker, true)
 				p.mu.Unlock()
@@ -1807,6 +1810,41 @@ func (r *Registry) gateStateReasonLocked(view *gateView, model string, traits Re
 		}
 		if !view.moved() {
 			return reason == GateReasonCount, reason
+		}
+	}
+}
+
+// rejectedGateClassification reads, for a provider the snapshot just dropped,
+// the two gate facts the scan's rejection tallies need: whether the node-health
+// breaker or the health-ejection gate is open (a breaker-bypassed fail-open
+// re-scan could rescue the provider — breakerRejected) and whether the pair is
+// capacity-cooled (transient capacity, not structural absence —
+// capacityRejections). Those tallies decide the fail-open re-scan and whether
+// an all-cooled fleet reads as capacity or as no_provider, so they are
+// confirmed like the dispatch-deciding reads: the snapshot released p.mu, a
+// rebind can land before these reads and, for a source gate SHARED with a
+// sibling session, republish it as empty, and an unconfirmed read would then
+// miss the very gate that rejected the provider. The view is confirmed against
+// p.gate and re-read from the session's new gate when it moved (gateView).
+// Caller holds r.mu and NOT p.mu (it is taken here for the identity read).
+func (r *Registry) rejectedGateClassification(view *gateView, model string, now time.Time, nowNS int64, ignoreProviderBreaker bool) (brokenOrEjected, capacityCooled bool) {
+	for {
+		g := view.g
+		brokenOrEjected = false
+		if !ignoreProviderBreaker {
+			if g.breakerOpenAt(nowNS) {
+				brokenOrEjected = true
+			} else if healthEjectionEnabled() {
+				// r.mu → p.mu is the established order.
+				view.p.mu.Lock()
+				sid := stableProviderIdentityLocked(view.p)
+				view.p.mu.Unlock()
+				brokenOrEjected = r.ejectionOpenFor(g, sid, nowNS)
+			}
+		}
+		capacityCooled = g.capacityCooled(model, now)
+		if !view.moved() {
+			return brokenOrEjected, capacityCooled
 		}
 	}
 }
