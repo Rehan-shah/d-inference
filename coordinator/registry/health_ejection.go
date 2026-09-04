@@ -246,9 +246,11 @@ func (r *Registry) migrateFaultStateLocked(oldKey, newKey string) {
 			delete(r.inferenceErrorCooldowns, k)
 		}
 	}
-	// Disconnect-flush strike tags and the last-seen binary version follow
-	// the identity too (version_reset.go); an existing version under the new
-	// key is the more recent binding and wins.
+	// Disconnect-flush strike tags, the last-seen binary version, and the
+	// version-reset throttle timestamp follow the identity too
+	// (version_reset.go): an existing version under the new key is the more
+	// recent binding and wins; the later reset timestamp wins so a rebind can
+	// never hand the identity a second reset inside the interval.
 	for k, flush := range r.inferenceErrorFlushStrikes {
 		if k.ProviderID == oldKey {
 			nk := k
@@ -262,6 +264,12 @@ func (r *Registry) migrateFaultStateLocked(oldKey, newKey string) {
 			r.identityVersions[newKey] = v
 		}
 		delete(r.identityVersions, oldKey)
+	}
+	if at, ok := r.identityVersionResetAt[oldKey]; ok {
+		if cur, exists := r.identityVersionResetAt[newKey]; !exists || at.After(cur) {
+			r.identityVersionResetAt[newKey] = at
+		}
+		delete(r.identityVersionResetAt, oldKey)
 	}
 
 	// Node-health breaker.

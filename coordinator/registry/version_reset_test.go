@@ -300,3 +300,130 @@ func TestInferenceFlushStrikes_NonFlushStrikePrunesTags(t *testing.T) {
 		t.Fatalf("stale flush tag survived a non-flush strike: %v", flush)
 	}
 }
+
+// dieAbruptlyWithFlushKeyed is dieAbruptlyWithFlush for a session bound to an
+// arbitrary stable identity (the serial fixture above is hardcoded).
+func dieAbruptlyWithFlushKeyed(t *testing.T, r *Registry, id, stable string) {
+	t.Helper()
+	p := r.GetProvider(id)
+	if p == nil {
+		t.Fatalf("provider %s not registered", id)
+	}
+	for i := 0; i < 3; i++ {
+		p.AddPending(&PendingRequest{
+			RequestID: fmt.Sprintf("%s-req-%d", id, i),
+			Model:     "m",
+			ErrorCh:   make(chan protocol.InferenceErrorMessage, 1),
+		})
+	}
+	r.DisconnectWithReason(id, DisconnectReasonReadError)
+	if sid := r.GetProviderStableIdentity(id); sid != stable {
+		t.Fatalf("stable identity after disconnect = %q, want %q", sid, stable)
+	}
+	for i := 0; i < 2; i++ {
+		r.RecordInferenceError(id, "m", 502, "base")
+	}
+	for i := 0; i < 5; i++ {
+		r.RecordProviderOutcome(id, false, 502, "provider disconnected")
+	}
+	for i := 0; i < 8; i++ {
+		r.RecordProviderServeOutcome(stable, false, 502, "provider disconnected")
+	}
+}
+
+func assertIdentityQuarantineKeyed(t *testing.T, r *Registry, queryID, stable string, want bool) {
+	t.Helper()
+	if got := r.InferenceErrorCooldownActive(queryID, "m", "base"); got != want {
+		t.Errorf("InferenceErrorCooldownActive(%s) = %v, want %v", queryID, got, want)
+	}
+	if got := r.ProviderBreakerOpen(queryID); got != want {
+		t.Errorf("ProviderBreakerOpen(%s) = %v, want %v", queryID, got, want)
+	}
+	if got := r.HealthEjectionOpen(stable); got != want {
+		t.Errorf("HealthEjectionOpen(%s) = %v, want %v", stable, got, want)
+	}
+}
+
+// TestVersionResetThrottle_FollowsIdentityRebind: the per-identity reset
+// timestamp must migrate with the identity on a sekey: → serial: rebind (MDA
+// enrichment of a live session). Otherwise the serial identity starts with no
+// throttle record and a second version change inside the 10-minute interval
+// clears its flush strikes again — the laundering the interval exists to stop.
+func TestVersionResetThrottle_FollowsIdentityRebind(t *testing.T) {
+	r := New(testLogger())
+	const pk, serial = "PK-REBIND", "SER-REBIND"
+	const sekeyID, serialID = "sekey:" + pk, "serial:" + serial
+	register := func(id string) *Provider {
+		msg := testRegisterMessage()
+		msg.Models = []protocol.ModelInfo{{ID: "m", ModelType: "chat"}}
+		return r.Register(id, nil, msg)
+	}
+	attestSEKey := func(p *Provider) {
+		p.SetAttestationResult(&attestation.VerificationResult{Valid: true, PublicKey: pk})
+	}
+
+	// s1 on 0.9.0 binds the SE-key identity and dies abruptly with work in flight.
+	s1 := register("s1")
+	s1.SetVersion("0.9.0")
+	attestSEKey(s1)
+	dieAbruptlyWithFlushKeyed(t, r, "s1", sekeyID)
+	assertIdentityQuarantineKeyed(t, r, "s1", sekeyID, true)
+
+	// s2 on 0.9.1: the version change consumes the identity's one reset.
+	s2 := register("s2")
+	attestSEKey(s2)
+	s2.SetVersion("0.9.1")
+	assertIdentityQuarantineKeyed(t, r, "s2", sekeyID, false)
+	dieAbruptlyWithFlushKeyed(t, r, "s2", sekeyID)
+	assertIdentityQuarantineKeyed(t, r, "s2", sekeyID, true)
+
+	// s3 binds the SE key, is enriched to the serial (rebind), and only then
+	// reports a third version. The reset consumed under sekey: still throttles
+	// the serial: identity.
+	s3 := register("s3")
+	attestSEKey(s3)
+	s3.SetAttestationResult(&attestation.VerificationResult{Valid: true, PublicKey: pk, SerialNumber: serial})
+	if got := faultKeyOf(r, "s3"); got != serialID {
+		t.Fatalf("enriched attestation must rebind to the serial key, got %q", got)
+	}
+	s3.SetVersion("0.9.2")
+	assertIdentityQuarantineKeyed(t, r, "s3", serialID, true)
+
+	r.mu.RLock()
+	_, orphan := r.identityVersionResetAt[sekeyID]
+	_, moved := r.identityVersionResetAt[serialID]
+	r.mu.RUnlock()
+	if orphan || !moved {
+		t.Fatalf("reset timestamp after rebind: under old key=%v, under new key=%v; want moved", orphan, moved)
+	}
+}
+
+// Both keys holding a reset timestamp merge to the LATER one, whichever side
+// it is on, so a rebind can never shorten the interval.
+func TestMigrateFaultState_ResetTimestampKeepsLater(t *testing.T) {
+	older := time.Now().Add(-5 * time.Minute)
+	newer := time.Now()
+	for _, tc := range []struct {
+		name     string
+		src, dst time.Time
+	}{
+		{"newer source wins", newer, older},
+		{"newer destination kept", older, newer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := New(testLogger())
+			r.mu.Lock()
+			r.identityVersionResetAt = map[string]time.Time{"old": tc.src, "new": tc.dst}
+			r.migrateFaultStateLocked("old", "new")
+			got, ok := r.identityVersionResetAt["new"]
+			_, orphan := r.identityVersionResetAt["old"]
+			r.mu.Unlock()
+			if !ok || !got.Equal(newer) {
+				t.Fatalf("merged reset timestamp = %v (present=%v), want %v", got, ok, newer)
+			}
+			if orphan {
+				t.Fatal("reset timestamp orphaned under the old key")
+			}
+		})
+	}
+}
