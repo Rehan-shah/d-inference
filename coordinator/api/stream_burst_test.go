@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/eigeninference/d-inference/coordinator/protocol"
+	"github.com/eigeninference/d-inference/coordinator/store"
 	"nhooyr.io/websocket"
 )
 
@@ -57,9 +58,13 @@ var chatBurstGolden = func() string {
 
 // TestStreamRelay_ChatBurstByteIdentical: a provider that bursts 50 chunks
 // (plus finish, usage and its own [DONE]) then completes yields exactly the
-// pre-coalescing byte stream.
+// pre-coalescing byte stream, and the persisted request profile accounts for
+// it in SSE frames (chunks_out = 53, not the handful of coalesced flushes).
 func TestStreamRelay_ChatBurstByteIdentical(t *testing.T) {
-	_, reg, _, ts := setupTestServer(t)
+	// A clean single-attempt success is sampled at defaultProfileSample (10%);
+	// the profile assertions below need this request's row persisted.
+	t.Setenv(envProfileSampleRate, "1")
+	srv, reg, st, ts := setupTestServer(t)
 	defer ts.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -98,6 +103,30 @@ func TestStreamRelay_ChatBurstByteIdentical(t *testing.T) {
 	}
 	if strings.Count(string(body), "[DONE]") != 1 {
 		t.Errorf("stream must carry exactly one [DONE]: %q", body)
+	}
+
+	// The profiler's relay stamps under coalescing: every frame counts once
+	// (53 events over ~9 flushes), bytes_out is the exact byte stream the
+	// client received, the terminal flush is stamped and no write failed.
+	if !srv.profilerEnabled() {
+		t.Fatal("profiler must be on by default with a store")
+	}
+	var recs []store.RequestProfileRecord
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if recs = st.RequestProfilesSince(time.Time{}); len(recs) == 1 {
+			break
+		}
+	}
+	if len(recs) != 1 {
+		t.Fatalf("persisted request profiles = %d, want 1", len(recs))
+	}
+	rec := recs[0]
+	if rec.ChunksOut != 53 || rec.BytesOut != int64(len(chatBurstGolden)) {
+		t.Fatalf("profile chunks_out=%d bytes_out=%d, want 53 frames / %d bytes (frames, not flushes)",
+			rec.ChunksOut, rec.BytesOut, len(chatBurstGolden))
+	}
+	if rec.DoneFlushedUS == nil || rec.ClientWriteErr {
+		t.Fatalf("profile done_flushed_us=%v client_write_err=%v, want stamped / false", rec.DoneFlushedUS, rec.ClientWriteErr)
 	}
 }
 

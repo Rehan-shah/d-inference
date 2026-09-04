@@ -91,10 +91,10 @@ added removed. Conflicts and the semantic hazards from
 
 | Where | Master side | Resolution |
 |---|---|---|
-| `api/consumer.go` (3 hunks), `api/generic_endpoint_stream.go` (1 hunk) | #809 `rs.wrote(n, werr)` after every client write, `rs.done()` after the terminal `[DONE]`, `profileClientGone(pr, phaseAfterCommit)` on every `Context().Done()` arm; #799 `writeChatStreamProviderError` + in-band `ErrorCh` select | perf's `chatStreamRelay` + `finishStream()` structure kept. `chatStreamRelay.flush` now returns `(frames, bytes, err)` and the new `relayStamps.wroteFrames` records them, so `chunks_out` keeps meaning SSE frames delivered (not flushes), `bytes_out` counts only accepted bytes, and a failed/short write sets `client_write_err`. `rs.done()` runs once after the terminal flush on the non-Responses success path (as on master). `profileClientGone` is on every relay `Context().Done()` arm including the generic relay's `finishStream`. #799's error writer, in-band select, `maxFirstChunkTimeoutRetries`, `errRoutingScanSaturated`, `errClientGoneBeforeScan` and the `dispatchOneProvider`/`dispatchWithReserver` arities are master's. |
+| `api/consumer.go` (3 hunks), `api/generic_endpoint_stream.go` (1 hunk) | #809 `rs.wrote(n, werr)` after every client write, `rs.done()` after the terminal `[DONE]`, `profileClientGone(pr, phaseAfterCommit)` on every `Context().Done()` arm; #799 `writeChatStreamProviderError` + in-band `ErrorCh` select | perf's `chatStreamRelay` + `finishStream()` structure kept. `chatStreamRelay.flush` now returns `(frames, bytes, err)` and the new `relayStamps.wroteFrames` records them, so `chunks_out` keeps meaning SSE frames delivered (not flushes), `bytes_out` counts only accepted bytes, and a failed/short write sets `client_write_err`. `rs.done()` runs once after the terminal flush on the non-Responses success path (as on master). `profileClientGone` is on every relay `Context().Done()` arm including the generic relay's `finishStream`. #799's error writer, in-band select, `maxFirstChunkTimeoutRetries`, `errRoutingScanSaturated`, `errClientGoneBeforeScan` and the `dispatchOneProvider`/`dispatchWithReserver` arities are master's. `TestStreamRelay_ChatBurstByteIdentical` now also reads back the persisted request profile: `chunks_out` = 53 frames (a flush-count implementation would read ~9), `bytes_out` = the golden's length, `done_flushed_us` stamped, `client_write_err` false. |
 | H7 — six #809 `store.Store` methods | `RecordRequestProfiles`, `RequestProfilesSince[Filtered]`, `RecordFleetSnapshots`, `FleetSnapshotsSince`, `PruneTelemetry` | `CachedStore` embeds `Store` and overrides none of them; `TestCachedStoreForwardsProfilerMethods` writes through the wrapper and reads back from the inner store. `profiler_sink.go` is its own goroutine, so the route sink's post-close rejection cannot drop profile writes. |
 | H9 — two flush-on-Close sinks | #809 `profileSink` | `Server.Close` runs `routeTelemetry.closeAndWait(2 s)` then `profiler.close()`; `main.go` registers `defer pgStore.Close()` before `defer srv.Close()`, so both flush before the pool closes. |
-| H10 — `api/profiler_sink.go` calls `isPowerOfTen` | perf's sink rewrite deleted it (kept `crossesPowerOfTen(before, after)`) | one call site switched to `crossesPowerOfTen(n-1, n)`: identical throttle (fires at 1, 10, 100, …), no duplicated helper. |
+| H10 — `api/profiler_sink.go` calls `isPowerOfTen` | perf's sink rewrite deleted it (kept `crossesPowerOfTen(before, after)`) | one call site switched to `crossesPowerOfTen(n-1, n)`: identical throttle (fires at 1, 10, 100, …), no duplicated helper. The walk now stops at 10^18 (`p > 0` guard) instead of overflowing near `math.MaxInt64`; cases added to `TestCrossesPowerOfTen`. |
 | H11 — `store/memory.go` `strconv` | #809 kept one `strconv.Itoa` use; perf dropped the import | import restored. |
 | `api/server.go`, `cmd/coordinator/main.go` | #816 rewrote the runtime manifest loading in both | auto-merged; perf's hunks (bounded sink flush in `Close`, catalog-cache invalidation, `emitStoreCacheGauges`, `store.NewCached` wiring) do not overlap. |
 | `AGENTS.md` | — | the perf branch's "per-model provider index" invariant (a `registry/model_index.go` contract) is dropped here; it returns with PR B. |
@@ -144,6 +144,15 @@ v2.1.6 run ./...` 0 issues. `go test ./store/` against a fresh Postgres 16
 `OverPostgres` and `ForwardsProfilerMethods`), `TestInferenceRoute*`,
 `TestPostgresCredit*`, `TestCreditSemanticsAcrossBackends`,
 `TestConcurrentCreditDebitLedgerConsistency`, `TestPerfE2E_ChatCompletions`.
+
+Independent review (general-purpose agent, read-only) returned PASS on all
+four criteria — #799/#809 relay semantics, decorator forwarding, registry
+byte-identical, test adequacy — with one should-fix (the profile-row
+assertion above) and two nits (the overflow guard; the `flushedFrames`
+comment now says the emitter relays stamp per event write, ahead of their
+deferred Flush), all applied. staticcheck items it listed in auto-merged perf
+files (`S1017` ×2, `ST1008`, `ST1018`, `SA4006`) are pre-existing on the source
+branch and out of scope here.
 
 ## Notes for reviewers
 

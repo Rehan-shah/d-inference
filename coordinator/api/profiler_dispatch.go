@@ -209,7 +209,9 @@ func (r *relayStamps) flushed(bytes int) {
 // chunks_out advances by the frame count (the relays coalesce already-queued
 // chunks into one write, and the field keeps meaning "frames delivered"),
 // bytes_out by the bytes accepted, and first_flush_us / max_chunk_gap_us are
-// stamped per flush, which is when the bytes reach the wire.
+// stamped per call: per flush in the chat relay (when the bytes reach the
+// wire), per event write in the emitter relays (just ahead of their deferred
+// Flush).
 func (r *relayStamps) flushedFrames(frames, bytes int) {
 	if r == nil || r.rp == nil || bytes <= 0 || frames <= 0 {
 		return
