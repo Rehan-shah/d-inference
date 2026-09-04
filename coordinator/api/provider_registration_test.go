@@ -182,54 +182,53 @@ func TestProviderRegistrationBindsProtectedRuntimeClaims(t *testing.T) {
 
 func TestProviderRegistrationAttestationFreshnessVersionGate(t *testing.T) {
 	cases := []struct {
-		name      string
-		version   string
-		timestamp time.Time
-		accepted  bool
+		name            string
+		version         string
+		timestampOffset time.Duration
+		accepted        bool
 	}{
 		{
-			name:      "missing version retains legacy reconnect semantics",
-			timestamp: time.Now().Add(-10 * time.Minute),
-			accepted:  true,
+			name:            "missing version retains legacy reconnect semantics",
+			timestampOffset: -10 * time.Minute,
+			accepted:        true,
 		},
 		{
-			name:      "last legacy release accepts reconnect replay",
-			version:   "0.8.14",
-			timestamp: time.Now().Add(-10 * time.Minute),
-			accepted:  true,
+			name:            "last legacy release accepts reconnect replay",
+			version:         "0.8.14",
+			timestampOffset: -10 * time.Minute,
+			accepted:        true,
 		},
 		{
-			name:      "capability release rejects stale replay",
-			version:   minProviderVersionForReconnectAttestation,
-			timestamp: time.Now().Add(-10 * time.Minute),
+			name:            "capability release rejects stale replay",
+			version:         minProviderVersionForReconnectAttestation,
+			timestampOffset: -10 * time.Minute,
 		},
 		{
-			name:      "newer release rejects stale replay",
-			version:   "0.8.16",
-			timestamp: time.Now().Add(-10 * time.Minute),
+			name:            "newer release rejects stale replay",
+			version:         "0.8.16",
+			timestampOffset: -10 * time.Minute,
 		},
 		{
-			name:      "capability release accepts future skew just under boundary",
-			version:   minProviderVersionForReconnectAttestation,
-			timestamp: time.Now().Add(RegistrationAttestationMaxFutureSkew - time.Second),
-			accepted:  true,
+			name:            "capability release accepts future skew just under boundary",
+			version:         minProviderVersionForReconnectAttestation,
+			timestampOffset: RegistrationAttestationMaxFutureSkew - time.Second,
+			accepted:        true,
 		},
 		{
-			name:      "capability release accepts future skew at boundary",
-			version:   minProviderVersionForReconnectAttestation,
-			timestamp: time.Now().Add(RegistrationAttestationMaxFutureSkew),
-			accepted:  true,
+			name:            "capability release accepts future skew at boundary",
+			version:         minProviderVersionForReconnectAttestation,
+			timestampOffset: RegistrationAttestationMaxFutureSkew,
+			accepted:        true,
 		},
 		{
-			name:      "capability release rejects future skew over boundary",
-			version:   minProviderVersionForReconnectAttestation,
-			timestamp: time.Now().Add(RegistrationAttestationMaxFutureSkew + time.Second),
+			name:            "capability release rejects future skew beyond freshness window",
+			version:         minProviderVersionForReconnectAttestation,
+			timestampOffset: RegistrationAttestationMaxFutureSkew + time.Minute,
 		},
 		{
-			name:      "capability release accepts fresh reconnect",
-			version:   minProviderVersionForReconnectAttestation,
-			timestamp: time.Now(),
-			accepted:  true,
+			name:     "capability release accepts fresh reconnect",
+			version:  minProviderVersionForReconnectAttestation,
+			accepted: true,
 		},
 	}
 
@@ -244,12 +243,17 @@ func TestProviderRegistrationAttestationFreshnessVersionGate(t *testing.T) {
 				logger,
 			)
 			publicKey := testPublicKeyB64()
+			// Construct each signed timestamp immediately before its case runs.
+			// The wire fixture uses whole seconds, so the rejected future case
+			// stays a minute outside the window: a one-second margin could be
+			// rounded away and cross inside while earlier cases were running.
+			timestamp := time.Now().Add(tc.timestampOffset)
 			regMsg := &protocol.RegisterMessage{
 				Type:      protocol.TypeRegister,
 				Version:   tc.version,
 				PublicKey: publicKey,
 				Attestation: buildTestAttestationJSONWithFields(
-					t, publicKey, "", "", tc.timestamp, nil),
+					t, publicKey, "", "", timestamp, nil),
 			}
 			provider := reg.Register(fmt.Sprintf("reconnect-%d", index), nil, regMsg)
 			srv.verifyProviderAttestation(provider.ID, provider, regMsg)
