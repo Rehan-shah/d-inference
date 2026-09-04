@@ -1,6 +1,6 @@
 # Scheduling: queues, slots, capacity and the warm pool
 
-> Last updated: 2026-09-04 · commit `73df54ad0`
+> Last updated: 2026-09-04 · commit `8a25c680e`
 
 Scheduling is the coordinator's model of *how much work the fleet can take
 and where the weights are*: the per-model request queue, the per-slot state
@@ -438,8 +438,11 @@ at most once per `identityVersionResetMinInterval = 10 * time.Minute`.
 Genuine 500/504 faults survive. Each tracker discards a late 502 from a session
 dropped before that reset while holding its mutation lock; request goroutines
 cannot reopen the new binary's quarantine after the reset. Same-version churn
-and a drop after a throttled reset keep their strikes
-(`coordinator/registry/version_reset.go`, `supersededDisconnectFlushLocked`).
+and a drop after a throttled reset keep their strikes. Cached disconnected
+identities follow identity enrichment without changing their original drop
+time, so a later weaker-identity reconnect cannot resurrect superseded faults
+(`coordinator/registry/version_reset.go`, `supersededDisconnectFlushLocked`;
+`coordinator/registry/health_ejection.go`, `migrateFaultStateLocked`).
 
 ## Invariants
 

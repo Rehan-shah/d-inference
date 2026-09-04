@@ -215,6 +215,16 @@ func (r *Registry) migrateFaultStateLocked(oldKey, newKey string) {
 		return
 	}
 
+	// Late disconnect-flush outcomes must follow the same identity as the
+	// migrated windows and reset timestamp. Preserve each drop time so the
+	// migration neither extends the cache TTL nor changes reset ordering.
+	for sessionID, cached := range r.disconnectedStableIDs {
+		if cached.id == oldKey {
+			cached.id = newKey
+			r.disconnectedStableIDs[sessionID] = cached
+		}
+	}
+
 	// Dispatch-load cooldowns: struct keys per (fault key, model).
 	for k, expiry := range r.dispatchLoadCooldowns {
 		if k.FaultKey == oldKey {

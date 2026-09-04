@@ -534,3 +534,42 @@ func TestVersionResetInterleavedWithTrackerWrites(t *testing.T) {
 		})
 	}
 }
+
+// A disconnect cache must follow an identity enrichment just like the fault
+// windows and reset timestamp. Otherwise a late old-session flush recreates
+// the emptied sekey history and a later same-version reconnect merges those
+// superseded faults back into the serial identity.
+func TestVersionResetSurvivesDisconnectedIdentityEnrichment(t *testing.T) {
+	r := New(testLogger())
+	const publicKey = "version-reset-shared-se-key"
+	bindKey := func(id, version string) *Provider {
+		msg := testRegisterMessage()
+		msg.Models = []protocol.ModelInfo{{ID: "m", ModelType: "chat"}}
+		p := r.Register(id, nil, msg)
+		p.SetAttestationResult(&attestation.VerificationResult{Valid: true, PublicKey: publicKey})
+		p.SetVersion(version)
+		return p
+	}
+	enrich := func(p *Provider) {
+		p.SetAttestationResult(&attestation.VerificationResult{
+			Valid: true, PublicKey: publicKey, SerialNumber: versionResetSerial,
+		})
+	}
+	bindKey("old-key-session", "0.9.0")
+	dropAbruptlyUnrecorded(t, r, "old-key-session")
+	current := bindKey("current-key-session", "0.9.1")
+	enrich(current)
+	for range 8 {
+		r.RecordInferenceError("old-key-session", "m", 502, "base")
+		r.RecordProviderOutcome("old-key-session", false, 502, "provider disconnected")
+		r.RecordProviderSessionServeOutcome("old-key-session", false, 502, "provider disconnected")
+	}
+	// Reconnecting through the weaker identity must not resurrect the old
+	// binary's flushes when the same serial is attested again.
+	next := bindKey("next-key-session", "0.9.1")
+	enrich(next)
+	assertIdentityQuarantine(t, r, next.ID, false)
+	if got := r.GetProviderStableIdentity("old-key-session"); got != versionResetStable {
+		t.Fatalf("disconnected identity = %q, want enriched %q", got, versionResetStable)
+	}
+}
