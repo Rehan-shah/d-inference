@@ -455,7 +455,7 @@ func (r *Registry) ReserveNextFromPlan(pr *PendingRequest, plan *DispatchPlan, e
 		}
 		// Half-open capacity probe: check-and-claim under gate.mu, identical to
 		// the primary reservation path (p.mu → gate.mu).
-		if !r.gateOf(p).tryClaimCapacityProbe(model, now) {
+		if !r.tryClaimCapacityProbe(p, model, now) {
 			p.mu.Unlock()
 			skip(PlanSkipGateRejected)
 			return nil, RoutingDecision{}, false

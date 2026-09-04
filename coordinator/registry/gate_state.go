@@ -537,6 +537,27 @@ func (r *Registry) reresolveGate(ref gateRef) gateRef {
 	return r.sessionGateRef(ref.session, ref.insert)
 }
 
+// refHasPairState is the lock-free "does this identity hold any of the
+// flagged per-model state" fast path for a ref about to be locked, made safe
+// against a rebind: an emptied source gate's flag says "nothing" precisely
+// because the state moved to the session's new gate, so a cleared flag counts
+// only while p.gate still points at ref.g; otherwise the ref is re-resolved
+// and the flag read again. Sound without a lock because the migration
+// repoints p.gate BEFORE it republishes the emptied source (migrateGateLocked)
+// — a reader that sees the cleared flag then sees the moved pointer. A set
+// flag needs no confirmation: the caller proceeds to lockGate, which
+// validates under the lock. Returns the ref to lock. A retired gate needs no
+// handling here: it was idle, so "nothing" is true for the identity.
+func (r *Registry) refHasPairState(ref gateRef, flag uint32) (gateRef, bool) {
+	for retries := 0; ; retries++ {
+		has := ref.g.hasPairState(flag)
+		if has || retries >= gateRelockMaxRetries || ref.p == nil || ref.p.gate.Load() == ref.g {
+			return ref, has
+		}
+		ref = r.reresolveGate(ref)
+	}
+}
+
 // gateHold is an acquired gate.mu. unlock releases the gate and only then
 // reports a long acquisition wait to the observer, so the DogStatsD emit never
 // runs inside the critical section.

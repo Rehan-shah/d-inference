@@ -758,7 +758,7 @@ func (r *Registry) commitProviderReservation(
 	// Half-open capacity probe: check-and-claim under gate.mu (p.mu → gate.mu).
 	// A pair whose expired cooldown was claimed by a concurrent commit for the
 	// same identity is closed again; reject rather than leak a second probe.
-	if !r.gateOf(p).tryClaimCapacityProbe(model, now) {
+	if !r.tryClaimCapacityProbe(p, model, now) {
 		return nil, nil, reservationCandidateRejected,
 			routingDecisionForCommitRejection(model, rejectCapacity, false)
 	}

@@ -303,24 +303,64 @@ func (r *Registry) recordCapacityReject(providerID, modelID string, deratePair, 
 }
 
 // tryClaimCapacityProbe claims the single half-open probe for an EXPIRED
-// cooldown entry, called by the reservation commit at the moment a request is
-// actually bound to the pair. The check and the claim are ONE gate.mu section,
-// so concurrent commits for the same identity serialize here even though the
-// commit itself no longer holds the registry write lock: the first to reserve
-// the pair claims the probe and every later one sees the fresh claim.
+// cooldown entry, called by the reservation commit (under p.mu, in both
+// commit modes) at the moment a request is actually bound to the pair. The
+// check and the claim are ONE gate.mu section, so concurrent commits for the
+// same identity serialize here even though the commit itself no longer holds
+// the registry write lock: the first to reserve the pair claims the probe and
+// every later one sees the fresh claim.
 //
 // Returns false when the pair's gate is CLOSED right now — inside its TTL, or
 // expired with another request's probe claim still fresh — so the caller
 // rejects the reservation instead of leaking a second probe through the
 // post-expiry window. Returns true (a no-op) for a pair with no cooldown entry
 // — the overwhelmingly common case, one lock-free flag load — and true after
-// claiming an unclaimed or stale slot. nil-safe.
-func (g *gateState) tryClaimCapacityProbe(model string, now time.Time) bool {
-	if !g.hasPairState(gateFlagCapacityCooldown) {
+// claiming an unclaimed or stale slot. nil-safe (a bare Provider has no gate).
+//
+// The claim is a mutation, so it goes through lockGate like the recorders: a
+// rebind that lands between loading p.gate and taking the lock moves the
+// cooldown entry to the session's new gate, and a claim made on the old
+// (emptied) gate would find no entry and admit — a leaked probe through a
+// cooled pair. lockGate sees p.gate moved and re-resolves. Lock order: the
+// caller holds p.mu; gatesMu (on a re-resolve) and gate.mu nest under it.
+func (r *Registry) tryClaimCapacityProbe(p *Provider, model string, now time.Time) bool {
+	return r.claimCapacityProbeRef(r.probeGateRef(p), model, now)
+}
+
+// probeGateRef resolves the gate the commit's probe claim targets: the
+// connected Provider's cached p.gate (no lock), remembering p so lockGate can
+// tell when the session rebound between this load and the lock. A Provider
+// that was never registered (bare test objects) falls back to the session
+// lookup; nil resolves to no gate.
+func (r *Registry) probeGateRef(p *Provider) gateRef {
+	if p == nil {
+		return gateRef{}
+	}
+	if g := p.gate.Load(); g != nil {
+		return gateRef{g: g.resolve(), p: p, session: p.ID}
+	}
+	return r.lookupSessionGateRef(p.ID)
+}
+
+// claimCapacityProbeRef is tryClaimCapacityProbe on an already-resolved ref
+// (split out so a test can interpose a rebind between resolution and claim).
+func (r *Registry) claimCapacityProbeRef(ref gateRef, model string, now time.Time) bool {
+	ref, has := r.refHasPairState(ref, gateFlagCapacityCooldown)
+	if !has {
 		return true
 	}
-	g = g.lockResolved()
-	defer g.mu.Unlock()
+	hold := r.lockGate(ref, "capacity_probe")
+	// Release directly, not via hold.unlock(): the caller holds p.mu (and
+	// r.mu in global commit mode), and the observer's DogStatsD emit must
+	// never run inside those sections. The probe's gate wait is therefore not
+	// reported; the recorders' waits on the same gates are.
+	defer hold.g.mu.Unlock()
+	return hold.g.tryClaimCapacityProbeLocked(model, now)
+}
+
+// tryClaimCapacityProbeLocked is the check-and-claim itself. Caller holds
+// g.mu (lockGate has validated the gate is the session's current one).
+func (g *gateState) tryClaimCapacityProbeLocked(model string, now time.Time) bool {
 	e, ok := g.capacityCooldowns[model]
 	if !ok {
 		return true
@@ -403,7 +443,8 @@ func (r *Registry) RecordCapacityAcceptOutcome(providerID, modelID string, count
 	var heartbeatAt time.Time
 	var rawRemaining int64
 	var budgetReported bool
-	if ref.g.hasPairState(gateFlagBudgetClamp) {
+	ref, hasClamp := r.refHasPairState(ref, gateFlagBudgetClamp)
+	if hasClamp {
 		heartbeatAt, rawRemaining, budgetReported = providerBudgetSnapshot(r.sessionProvider(providerID), modelID)
 	}
 	hold := r.lockGate(ref, "capacity_accept")

@@ -217,7 +217,7 @@ func TestTryClaimCapacityProbeIsExclusivePerIdentity(t *testing.T) {
 		wg.Add(1)
 		go func(p *Provider) {
 			defer wg.Done()
-			if reg.gateOf(p).tryClaimCapacityProbe(model, now) {
+			if reg.tryClaimCapacityProbe(p, model, now) {
 				claimed.Add(1)
 			}
 		}(p)
@@ -230,7 +230,7 @@ func TestTryClaimCapacityProbeIsExclusivePerIdentity(t *testing.T) {
 		t.Fatal("the claimed probe must close the gate for every session of the identity")
 	}
 	// No cooldown entry at all: the claim is a lock-free no-op that admits.
-	if !reg.gateOf(p1).tryClaimCapacityProbe("other-model", now) {
+	if !reg.tryClaimCapacityProbe(p1, "other-model", now) {
 		t.Fatal("a pair with no cooldown entry must always claim")
 	}
 }
@@ -253,8 +253,8 @@ func TestGateReadsAreNilSafe(t *testing.T) {
 	if pen, rate := g.capacityRatePenalty(reg.capacityRateCfg, "m", now); pen != 0 || rate != 0 {
 		t.Fatal("a nil gate must carry no rate penalty")
 	}
-	if !g.tryClaimCapacityProbe("m", now) {
-		t.Fatal("a nil gate must admit the probe claim")
+	if !reg.tryClaimCapacityProbe(bare, "m", now) || !reg.tryClaimCapacityProbe(nil, "m", now) {
+		t.Fatal("a provider with no gate must admit the probe claim")
 	}
 	if reg.ejectionOpenFor(g, "serial:none", now.UnixNano()) {
 		t.Fatal("an unknown identity must not read as ejected")
@@ -569,6 +569,7 @@ func TestGateRecordersRaceRebindsAndSweeps(t *testing.T) {
 		func(i int) { reg.RecordInferenceError(p1.ID, model, 500, "base") },
 		func(i int) { reg.RecordInferenceSuccess(p1.ID, model, "base") },
 		func(i int) { reg.ClearDispatchLoadCooldown(p1.ID, model) },
+		func(i int) { reg.tryClaimCapacityProbe(p1, model, time.Now()) },
 		func(i int) { reg.RecordProviderServeOutcome("sekey:PK-STRESS", i%2 == 0, 500, "internal error") },
 		func(i int) { reg.RecordProviderOutcome(p2.ID, true, 200, "") },
 		func(i int) { reg.RecordProviderOutcome(gone.ID, false, 502, "provider disconnected") },
@@ -633,4 +634,125 @@ func TestGateRecordersRaceRebindsAndSweeps(t *testing.T) {
 			t.Fatalf("a quiescent fault must land on p1's current gate: %+v", g)
 		}
 	})
+}
+
+// A reservation commit that resolved the probe's gate just before its session
+// rebound away from a SHARED identity must claim the probe on the session's
+// NEW gate — where the cooldown entry migrated — and leave the other
+// identity's (reset) state untouched. A claim on the old gate would find no
+// entry and admit: a leaked probe through a cooled pair. The claim is the
+// same in both commit modes (the mode only chooses the r.mu lock kind).
+func TestProbeClaimFollowsSharedIdentityRebind(t *testing.T) {
+	forEachCommitMode(t, func(t *testing.T, mode reserveCommitMode) {
+		reg := New(testLogger())
+		setReserveCommitModeForTest(reg, mode)
+		const model = "m"
+		p1 := makeSchedulerProvider(t, reg, "sess-probe-rebind-1", model, 100)
+		p2 := makeSchedulerProvider(t, reg, "sess-probe-rebind-2", model, 100)
+		pk := &attestation.VerificationResult{Valid: true, PublicKey: "PK-PROBE-REBIND"}
+		p1.SetAttestationResult(pk)
+		p2.SetAttestationResult(pk)
+		shared := reg.lookupGateForKey("sekey:PK-PROBE-REBIND")
+		if shared == nil || p1.gate.Load() != shared || p2.gate.Load() != shared {
+			t.Fatal("both sessions must share the identity's gate")
+		}
+		for i := 0; i < reg.capacityCooldownCfg.Threshold; i++ {
+			reg.RecordCapacityReject(p1.ID, model)
+		}
+		expireCapacityCooldown(reg, p1.ID, model)
+		if reg.CapacityCooldownActive(p1.ID, model) {
+			t.Fatal("precondition: an expired, unclaimed cooldown must read open")
+		}
+
+		// The commit resolves the probe's gate (under p.mu)...
+		ref := reg.probeGateRef(p1)
+		if ref.g != shared || ref.p != p1 {
+			t.Fatalf("probe ref = %+v, want the shared gate via p1", ref)
+		}
+		// ...and p1 enriches to a serial before the claim takes the lock.
+		p1.SetAttestationResult(&attestation.VerificationResult{Valid: true, PublicKey: "PK-PROBE-REBIND", SerialNumber: "SER-PROBE-REBIND"})
+		target := p1.gate.Load()
+		if target == shared || target.key != "serial:SER-PROBE-REBIND" {
+			t.Fatalf("p1's gate after the rebind = %+v, want serial:SER-PROBE-REBIND", target)
+		}
+		if !target.hasPairState(gateFlagCapacityCooldown) || shared.hasPairState(gateFlagCapacityCooldown) {
+			t.Fatal("precondition: the cooldown entry moved with the session")
+		}
+
+		now := time.Now()
+		if !reg.claimCapacityProbeRef(ref, model, now) {
+			t.Fatal("the expired, unclaimed probe must be claimable")
+		}
+		readGateForKey(reg, "serial:SER-PROBE-REBIND", func(g *gateState) {
+			if g == nil {
+				t.Fatal("the enriched identity's gate must exist")
+			}
+			if e := g.capacityCooldowns[model]; e == nil || !e.probeAt.Equal(now) {
+				t.Fatalf("the claim must land on the session's new gate: entry=%+v", e)
+			}
+		})
+		readGateForKey(reg, "sekey:PK-PROBE-REBIND", func(g *gateState) {
+			if g == nil {
+				t.Fatal("the shared gate must stay in the index for p2")
+			}
+			if len(g.capacityCooldowns) != 0 {
+				t.Fatalf("the other identity's state must be untouched by the stale claim: %+v", g.capacityCooldowns)
+			}
+		})
+		if !reg.CapacityCooldownActive(p1.ID, model) {
+			t.Fatal("the claimed probe must close the gate for p1's identity")
+		}
+		if reg.CapacityCooldownActive(p2.ID, model) {
+			t.Fatal("p2's identity carries no cooldown after the migration")
+		}
+		// A second commit through the live path sees the fresh claim: exactly
+		// one probe gets through.
+		if reg.tryClaimCapacityProbe(p1, model, now) {
+			t.Fatal("a second claim must see the fresh claim and reject")
+		}
+	})
+}
+
+// The lock-free "no per-model state" fast path the clear recorders and the
+// probe claim take before locking must not trust the flag of a gate the
+// session has moved away from: after a shared-identity rebind the emptied
+// source says "nothing" precisely because the state migrated. refHasPairState
+// re-resolves to the session's new gate; a genuinely empty current gate is
+// reported as such without a re-resolve.
+func TestRefHasPairStateFollowsSharedIdentityRebind(t *testing.T) {
+	reg := New(testLogger())
+	const model = "m"
+	p1 := makeSchedulerProvider(t, reg, "sess-flag-rebind-1", model, 100)
+	p2 := makeSchedulerProvider(t, reg, "sess-flag-rebind-2", model, 100)
+	pk := &attestation.VerificationResult{Valid: true, PublicKey: "PK-FLAG-REBIND"}
+	p1.SetAttestationResult(pk)
+	p2.SetAttestationResult(pk)
+	shared := reg.lookupGateForKey("sekey:PK-FLAG-REBIND")
+	reg.RecordDispatchLoadFailure(p1.ID, model)
+
+	ref := reg.lookupSessionGateRef(p1.ID) // ClearDispatchLoadCooldown's resolution
+	if ref.g != shared || ref.p != p1 || !shared.hasPairState(gateFlagDispatchLoad) {
+		t.Fatalf("pre-rebind ref = %+v, want the shared gate (with dispatch-load state) via p1", ref)
+	}
+	p1.SetAttestationResult(&attestation.VerificationResult{Valid: true, PublicKey: "PK-FLAG-REBIND", SerialNumber: "SER-FLAG-REBIND"})
+	target := p1.gate.Load()
+	if target == shared || shared.hasPairState(gateFlagDispatchLoad) || !target.hasPairState(gateFlagDispatchLoad) {
+		t.Fatal("precondition: the dispatch-load cooldown moved with the session and the shared gate reads empty")
+	}
+
+	got, has := reg.refHasPairState(ref, gateFlagDispatchLoad)
+	if !has || got.g != target || got.p != p1 {
+		t.Fatalf("refHasPairState = (%+v, %v), want the session's new gate with state", got, has)
+	}
+	// Through the real recorder: the completion-time clear lands on the new
+	// identity, so the pair is routable again.
+	reg.ClearDispatchLoadCooldown(p1.ID, model)
+	if reg.dispatchLoadCooled(p1.ID, model, time.Now()) {
+		t.Fatal("the clear must land on the session's new gate")
+	}
+	// A genuinely empty current gate: reported empty, ref unchanged.
+	got, has = reg.refHasPairState(reg.lookupSessionGateRef(p2.ID), gateFlagDispatchLoad)
+	if has || got.g != shared {
+		t.Fatalf("refHasPairState on p2's empty gate = (%+v, %v), want (shared, false)", got, has)
+	}
 }
