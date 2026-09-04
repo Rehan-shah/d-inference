@@ -2121,6 +2121,10 @@ type Registry struct {
 	// drainSuppress rate-limits HEARTBEAT-triggered queue drains per model
 	// after a saturated pass (queue_drain_suppress.go). Zero value ready.
 	drainSuppress queueDrainSuppressor
+	// drainPasses runs one queue-drain pass per model at a time and reruns it
+	// for triggers that landed mid-pass (queue_drain_coalesce.go). Zero value
+	// ready.
+	drainPasses queueDrainCoalescer
 
 	MinTrustLevel TrustLevel
 
@@ -2206,6 +2210,10 @@ type Registry struct {
 	// shared reading after winner selection and before the serialized commit.
 	// Production leaves it nil; tests set it before starting concurrent scans.
 	reservationAfterScan func(model string)
+	// drainBeforePop is a test-only barrier invoked with no locks held before
+	// every pop of a queue-drain pass, so a test can interleave a trigger at a
+	// chosen point of the pass. Production leaves it nil.
+	drainBeforePop func(model string)
 
 	// modelIndex maps advertised model id → providers advertising it, so the
 	// per-request fleet walks visit only providers that can pass the first

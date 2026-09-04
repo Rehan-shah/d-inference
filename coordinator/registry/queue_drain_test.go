@@ -8,7 +8,10 @@ package registry
 //     scanned (and admitted) in the same pass;
 //   - heartbeat drain suppression (queue_drain_suppress.go): a heartbeat within
 //     heartbeatDrainSuppressWindow of a saturated pass skips the model; every
-//     capacity-freeing trigger drains synchronously as before.
+//     capacity-freeing trigger drains synchronously as before;
+//   - drain-pass coalescing (queue_drain_coalesce.go): a trigger that lands
+//     while a pass holds popped waiters makes that pass rerun with fresh fleet
+//     state instead of scanning an empty queue.
 //
 // Every test drives a real Registry with real providers and a real queue and
 // counts full fleet scans through the reservationAfterScan hook, which fires
@@ -494,4 +497,55 @@ func TestHeartbeatDrainSuppressionArmsTrailingPass(t *testing.T) {
 	drainTestExpectScans(t, scans, 0, "heartbeat inside the second window")
 	waitTrailing("second window")
 	drainTestExpectScans(t, scans, 1, "trailing pass after the second window")
+}
+
+// TestDrainTriggerMidPassRerunsHeldWaiters pins the coalescing fence
+// (queue_drain_coalesce.go). Pass A (SetProviderIdle) pops first — scanned and
+// rejected on a saturated box — and second, skipped on first's verdict. Before
+// A's next pop a heartbeat exposes the whole budget and runs its own drain,
+// which finds the queue empty: both waiters are held by A. Without coalescing
+// A requeues both on the stale verdict and nothing rescans them until the
+// next trigger for the model; with it, the heartbeat's drain asks A to go
+// around once more, and both waiters are assigned before SetProviderIdle
+// returns — with the trailing-pass scheduler disabled, so a trailing drain
+// cannot be what rescued them.
+func TestDrainTriggerMidPassRerunsHeldWaiters(t *testing.T) {
+	reg := New(testLogger())
+	p := drainTestProvider(t, reg, "box", 1000, 1000)
+	reg.SetQueue(NewRequestQueue(8, 30*time.Second))
+	first := drainTestEnqueue(t, reg, drainTestPending("first", 800, 1024))
+	second := drainTestEnqueue(t, reg, drainTestPending("second", 800, 1024))
+	scans := drainScanCounter(reg)
+	drainTestClock(reg)
+
+	pops := 0
+	reg.drainBeforePop = func(model string) {
+		pops++
+		if pops == 3 {
+			reg.Heartbeat(p.ID, drainTestHeartbeat(0, 32_768))
+		}
+	}
+	reg.SetProviderIdle(p.ID)
+	reg.drainBeforePop = nil
+
+	if got := drainTestAwait(t, reg, first); got.ID != p.ID {
+		t.Fatalf("first assigned to %q, want %q", got.ID, p.ID)
+	}
+	if got := drainTestAwait(t, reg, second); got.ID != p.ID {
+		t.Fatalf("second assigned to %q, want %q", got.ID, p.ID)
+	}
+	// first scanned+rejected by A, nothing by the heartbeat's drain (the queue
+	// was empty), both scanned+admitted by the rerun.
+	drainTestExpectScans(t, scans, 3, "SetProviderIdle with a mid-pass heartbeat")
+	// The rerun is attributed to the trigger that asked for it.
+	if first.DrainTrigger != DrainTriggerHeartbeat || second.DrainTrigger != DrainTriggerHeartbeat {
+		t.Fatalf("DrainTrigger = (%q, %q), want both %q (the rerun ran for the heartbeat)",
+			first.DrainTrigger, second.DrainTrigger, DrainTriggerHeartbeat)
+	}
+	if depth := reg.Queue().QueueSize(drainTestModel); depth != 0 {
+		t.Fatalf("queue depth = %d, want 0", depth)
+	}
+	if reg.drainSuppress.suppressed(drainTestModel) {
+		t.Fatal("an admitting rerun left the saturation mark in place")
+	}
 }
