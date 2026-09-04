@@ -1299,23 +1299,29 @@ func TestRelayStampsCoalescedWriteCountsFrames(t *testing.T) {
 }
 
 // TestChatStreamRelayFlushReportsFramesAndBytes pins the relay side of the
-// same contract: flush returns the number of frames in the batch and the bytes
-// the ResponseWriter accepted, and an empty batch neither writes nor flushes.
+// same contract: flush records the number of frames in the batch and the bytes
+// the ResponseWriter accepted in the request profile, in one write and one
+// Flush, and an empty batch neither writes nor flushes.
 func TestChatStreamRelayFlushReportsFramesAndBytes(t *testing.T) {
-	rec := httptest.NewRecorder()
-	relay := newChatStreamRelay(&registry.PendingRequest{})
+	w := newCapturingResponseWriter()
+	rp := registry.NewRequestProfile(time.Now(), "c", nil, 0)
+	relay := newChatStreamRelay(&registry.PendingRequest{}, w, w, newRelayStamps(rp))
 	relay.writeFrame(`data: {"a":1}`)
 	relay.writeFrame(`data: {"b":2}`)
 	relay.writeFrame("data: [DONE]")
-	frames, n, err := relay.flush(rec, rec)
+	relay.flush()
 	want := "data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n"
-	if err != nil || frames != 3 || n != len(want) || rec.Body.String() != want || !rec.Flushed {
-		t.Fatalf("flush = (%d frames, %d bytes, %v) body=%q flushed=%v; want (3, %d, nil) %q",
-			frames, n, err, rec.Body.String(), rec.Flushed, len(want), want)
+	if w.body.String() != want || w.writes != 1 || w.flushes != 1 {
+		t.Fatalf("flush wrote %q in %d write(s) / %d flush(es); want %q in 1 / 1",
+			w.body.String(), w.writes, w.flushes, want)
 	}
-	rec2 := httptest.NewRecorder()
-	if frames, n, err := relay.flush(rec2, rec2); frames != 0 || n != 0 || err != nil || rec2.Flushed || rec2.Body.Len() != 0 {
-		t.Fatalf("empty flush = (%d, %d, %v) flushed=%v body=%d bytes; want zeros and no flush",
-			frames, n, err, rec2.Flushed, rec2.Body.Len())
+	if rp.ChunksOut.Load() != 3 || rp.BytesOut.Load() != int64(len(want)) || rp.ClientWriteErr.Load() {
+		t.Fatalf("profile chunks_out=%d bytes_out=%d client_write_err=%v; want 3 / %d / false",
+			rp.ChunksOut.Load(), rp.BytesOut.Load(), rp.ClientWriteErr.Load(), len(want))
+	}
+	relay.flush()
+	if w.writes != 1 || w.flushes != 1 || rp.ChunksOut.Load() != 3 || rp.BytesOut.Load() != int64(len(want)) {
+		t.Fatalf("empty flush must neither write nor flush nor count: writes=%d flushes=%d chunks_out=%d bytes_out=%d",
+			w.writes, w.flushes, rp.ChunksOut.Load(), rp.BytesOut.Load())
 	}
 }

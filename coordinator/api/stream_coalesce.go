@@ -20,6 +20,19 @@ import (
 // arms of the select for more than a handful of chunks.
 const maxCoalescedChunks = 32
 
+// maxCoalescedBatchBytes bounds the bytes one coalesced batch may hold before
+// it is written and flushed. maxCoalescedChunks alone bounds only the count:
+// the provider WebSocket read limit is 10 MiB (handleProviderWS), so one
+// decrypted chunk can approach 7.5 MiB, and a 32-chunk batch could reach
+// ~240 MiB — or ~1.9 GiB on the whole-channel drain (chunkBufferSize = 256)
+// ahead of a provider error — held in a single buffer per stream. Healthy
+// deltas are a few hundred bytes (32 of them ≈ 10 KiB), so the byte cap never
+// fires on a normal stream; it exists so a faulty or hostile provider cannot
+// turn concurrent streams into coordinator memory exhaustion. Only the chat
+// relay buffers frames itself (chatStreamRelay.buf); the emitter relays write
+// each event straight to the ResponseWriter and defer only the Flush.
+const maxCoalescedBatchBytes = 256 << 10
+
 // drainQueuedChunks non-blockingly pulls up to budget chunks that are already
 // queued in ch, handing each to fn in arrival order. It returns closed=true when
 // it observed the channel closed instead of a chunk; fn is not called for the
