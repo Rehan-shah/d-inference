@@ -282,6 +282,9 @@ func (r *Registry) detachSessionGate(p *Provider, stableID string) {
 	g := p.gate.Load()
 	if g != nil {
 		g.live--
+		g.mu.Lock()
+		g.touched = disconnectedAt
+		g.mu.Unlock()
 	}
 	if stableID != "" {
 		r.rememberDisconnectedStableIDLocked(p.ID, stableID, disconnectedAt)

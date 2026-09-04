@@ -225,7 +225,7 @@ func TestCancelSendCountsOnlyDeliveredFrames(t *testing.T) {
 	// first cancel for this request.
 	srv.zombieCanceller.record("req-stray-first", model, cancelCauseClientGonePre, time.Now())
 	srv.noteStrayChunk(live, live.ID, "req-stray-first", time.Now())
-	srv.sendRecordedCancel(live, "req-stray-first", model, cancelCauseClientGonePre, time.Now())
+	srv.sendRecordedCancel(live, "req-stray-first", model, cancelCauseClientGonePre)
 	packets = drain()
 	if got := sumMetric(t, packets, metricCancelSent, "cause:"+cancelCauseClientGonePre, "model:"+model); got != 1 {
 		t.Fatalf("a stray-first race must count one initial cancel, got %v: %v", got, packets)

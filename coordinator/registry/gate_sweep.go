@@ -32,7 +32,7 @@ const (
 // entries and the half-open re-arm semantics depend on that memory. Such
 // memory goes only when the whole gate is dropped. Caller holds g.mu.
 func (g *gateState) pruneLocked(r *Registry, now time.Time) (idle bool) {
-	idle = true
+	idle = !g.versionHistoryActive(now)
 	for model, expiry := range g.dispatchLoadCooldowns {
 		if !now.Before(expiry) {
 			delete(g.dispatchLoadCooldowns, model)

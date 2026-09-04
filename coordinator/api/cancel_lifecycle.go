@@ -68,7 +68,7 @@ func (s *Server) sendAbandonCancel(provider *registry.Provider, requestID, model
 	now := time.Now()
 	_, expired := s.zombieCanceller.record(requestID, model, cause, now)
 	s.emitExpiredCancelEntries(expired)
-	s.sendRecordedCancel(provider, requestID, model, cause, now)
+	s.sendRecordedCancel(provider, requestID, model, cause)
 }
 
 // sendRecordedCancel sends the cancel for a request already recorded in the
@@ -77,12 +77,13 @@ func (s *Server) sendAbandonCancel(provider *registry.Provider, requestID, model
 // full or a writer that has stopped delivered nothing, so the entry is kept
 // unsent (sent == 0) for the next stray chunk to retry, and a terminal that
 // arrives meanwhile is not reported as cancel-to-terminal.
-func (s *Server) sendRecordedCancel(provider *registry.Provider, requestID, model, cause string, now time.Time) {
-	if !s.sendProviderCancel(provider, requestID) {
-		s.zombieCanceller.noteSendFailed(requestID, now)
+func (s *Server) sendRecordedCancel(provider *registry.Provider, requestID, model, cause string) {
+	resendIndex, sent := s.zombieCanceller.send(requestID, func() bool {
+		return s.sendProviderCancel(provider, requestID)
+	})
+	if !sent {
 		return
 	}
-	resendIndex := s.zombieCanceller.markSent(requestID, time.Now())
 	if resendIndex > 0 {
 		// A stray chunk can deliver the first cancel while the abandon
 		// path releases capacity. This frame is then a resend too.
@@ -132,11 +133,12 @@ func (s *Server) noteStrayChunk(provider *registry.Provider, providerID, request
 	if !res.send {
 		return
 	}
-	if !s.sendProviderCancel(provider, requestID) {
-		s.zombieCanceller.noteSendFailed(requestID, now)
+	resendIndex, sent := s.zombieCanceller.send(requestID, func() bool {
+		return s.sendProviderCancel(provider, requestID)
+	})
+	if !sent {
 		return
 	}
-	resendIndex := s.zombieCanceller.markSent(requestID, time.Now())
 	if resendIndex < 0 {
 		// Untracked (zero-value Server): the frame went out, nothing to count.
 		return

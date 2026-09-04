@@ -265,7 +265,7 @@ func (s *Server) cancelDispatch(provider *registry.Provider, pr *registry.Pendin
 	s.registry.SetProviderIdle(provider.ID)
 	if removed != nil && !pr.HasCompletionIngress() {
 		pr.Profile.Mark(registry.StampCancelSent)
-		s.sendRecordedCancel(provider, pr.RequestID, pr.Model, cause, now)
+		s.sendRecordedCancel(provider, pr.RequestID, pr.Model, cause)
 	} else if created {
 		s.zombieCanceller.forget(pr.RequestID)
 	}
@@ -314,7 +314,7 @@ func (s *Server) cancelDispatchForFirstContentTimeout(
 	pr.ResolveSpeculativeEmptyCompletion(false)
 	s.registry.SetProviderIdle(provider.ID)
 	pr.Profile.Mark(registry.StampCancelSent)
-	s.sendRecordedCancel(provider, pr.RequestID, pr.Model, cancelCauseFirstChunkTimeout, now)
+	s.sendRecordedCancel(provider, pr.RequestID, pr.Model, cancelCauseFirstChunkTimeout)
 	s.refundProviderExtra(pr)
 	return true
 }

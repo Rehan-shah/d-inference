@@ -165,8 +165,9 @@ successful enqueue, excluding failed-enqueue retry delay. It uses a terminal
 frame, or the last subsequent stray chunk for an expired entry. A cancel that
 was never accepted contributes only to `inference.cancel_unresolved` on expiry,
 even if stray chunks arrived. `inference.cancelled_terminal` includes
-`delivered:true|false` for correlated terminals. Enqueue acceptance does not
-prove a frame reached the provider (`coordinator/api/cancel_lifecycle.go`,
+`delivered:true|false` for correlated terminals. Successful enqueue marking and terminal resolution share the tracker lock,
+so an immediate terminal cannot observe an unmarked accepted cancel.
+Enqueue acceptance does not prove a frame reached the provider (`coordinator/api/cancel_lifecycle.go`,
 `sendRecordedCancel`, `resolveCancelledTerminal`, `emitExpiredCancelEntries`).
 
 ### Read surfaces

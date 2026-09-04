@@ -1,6 +1,6 @@
 # Routing: how a request becomes a provider choice
 
-> Last updated: 2026-09-04 · commit `07d3056d5`
+> Last updated: 2026-09-04 · commit `589023969`
 
 Routing is the part of the coordinator that, given one inference request and
 the live fleet, picks the provider that should run it. It filters the fleet
@@ -536,7 +536,10 @@ eviction loop: it prunes per-model entries that can no longer gate routing
 and drops a gate with no live session once it has been idle for
 `gateIdleGrace = 10 * time.Minute`, marking it `retired` under `gate.mu`
 before the index delete so a recorder holding a stale pointer re-resolves.
-Half-open trip memory of a live gate is never pruned.
+Version metadata additionally keeps its gate for `identityVersionRetention`
+after activity, disconnect or reset (`coordinator/registry/version_history.go`);
+see [disconnect and reconnect](scheduling.md#disconnect). Half-open trip memory
+of a live gate is never pruned.
 
 **Observability.** `registry.gate.wait_ms` (DogStatsD histogram tagged
 `site:`, via `SetGateWaitObserver`) records a recorder's `gate.mu`

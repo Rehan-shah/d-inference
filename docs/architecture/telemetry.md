@@ -61,7 +61,11 @@ platform gauges (`providers.online`, `utilization.*`, `capacity.*`,
 `request_queue.depth`). How the scheduler reads the capacity fields:
 [`scheduling.md`](scheduling.md); the gate vocabulary: [`routing.md`](routing.md).
 
-`recordMLXCacheTelemetry` emits allocator snapshots as histograms and
+`recordMLXCacheTelemetry` emits allocator snapshots as histograms with a
+DogStatsD-only client, or as latest-value gauges through HTTPS when
+`DD_API_KEY` is configured (`coordinator/datadog/metrics_snapshot.go`,
+`HistogramOrGauge`). HTTPS gauges preserve snapshot visibility without
+claiming fleet percentiles. It emits
 cumulative reclaimer counters as nonnegative deltas from the previous accepted
 heartbeat. The first observation has no counter baseline; a reset contributes
 no negative delta (`coordinator/api/provider_mlx_cache_telemetry.go`). Tags

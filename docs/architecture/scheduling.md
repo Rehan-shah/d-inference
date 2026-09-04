@@ -1,6 +1,6 @@
 # Scheduling: queues, slots, capacity and the warm pool
 
-> Last updated: 2026-09-04 · commit `16cbbf6da`
+> Last updated: 2026-09-04 · commit `589023969`
 
 Scheduling is the coordinator's model of *how much work the fleet can take
 and where the weights are*: the per-model request queue, the per-slot state
@@ -443,6 +443,13 @@ and a drop after a throttled reset keep their strikes
 The reset and each fault mutation share the identity's `gateState.mu`; both
 live references and the disconnect cache use the same timestamp recorded by
 `detachSessionGate`. These request terminal paths never acquire `Registry.mu`.
+Cached disconnected identities follow enrichment without changing their drop
+times. Version metadata for departed identities remains for
+`identityVersionRetention = 20 * time.Minute` after the last activity or
+disconnect; live identities, recent resets and active fault state retain their
+gate. The existing eviction-loop gate sweep handles this cleanup
+(`coordinator/registry/version_history.go`, `versionHistoryActive`;
+`coordinator/registry/gate_sweep.go`, `sweepGates`).
 
 ## Invariants
 

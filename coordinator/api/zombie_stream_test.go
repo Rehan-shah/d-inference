@@ -293,3 +293,59 @@ func TestStrayChunkWarnRateLimit(t *testing.T) {
 		t.Fatalf("counter must reset after an allowed line: allow=%v n=%d", allow, n)
 	}
 }
+
+func TestCancelEnqueueIsAtomicWithTerminalResolution(t *testing.T) {
+	z := newZombieStreamCanceller()
+	z.record("immediate-terminal", "m", cancelCauseClientGonePost, time.Now())
+	enqueuing := make(chan struct{})
+	finishEnqueue := make(chan struct{})
+	sendDone := make(chan bool, 1)
+	go func() {
+		index, sent := z.send("immediate-terminal", func() bool {
+			close(enqueuing)
+			<-finishEnqueue
+			return true
+		})
+		sendDone <- sent && index == 0
+	}()
+	<-enqueuing
+	terminalStarted := make(chan struct{})
+	terminalDone := make(chan zombieEntry, 1)
+	go func() {
+		close(terminalStarted)
+		e, _ := z.terminal("immediate-terminal")
+		terminalDone <- e
+	}()
+	<-terminalStarted
+	// The provider may respond before enqueue returns; terminal correlation
+	// must wait until successful acceptance and its timestamp are recorded.
+	select {
+	case <-terminalDone:
+		close(finishEnqueue)
+		<-sendDone
+		t.Fatal("terminal removed the entry before the successful enqueue was marked")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(finishEnqueue)
+	if !<-sendDone {
+		t.Fatal("first successful enqueue was not recorded")
+	}
+	e := <-terminalDone
+	if e.sent != 1 || e.firstSentAt.IsZero() {
+		t.Fatalf("immediate terminal classified delivered enqueue as unsent: %+v", e)
+	}
+}
+
+func TestCancelEvictedEntryStillReceivesBestEffortSend(t *testing.T) {
+	z := newZombieStreamCanceller()
+	z.record("evicted", "m", cancelCauseClientGonePost, time.Now())
+	z.forget("evicted") // a bounded-map eviction before the abandon path resumes
+	called := false
+	index, sent := z.send("evicted", func() bool {
+		called = true
+		return true
+	})
+	if !called || !sent || index != -1 {
+		t.Fatalf("untracked best-effort send = (%d, %v), called=%v", index, sent, called)
+	}
+}

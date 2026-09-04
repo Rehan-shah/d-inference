@@ -4130,8 +4130,9 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	// coalesced fleet-wide to one plan per modelSwapPlanInterval, since N
 	// heartbeats inside that window would each re-derive the same plan; a
 	// heartbeat the window refuses arms one trailing plan for its end
-	// (model_swap_coalesce.go).
-	r.triggerModelSwapsFromHeartbeat(now)
+	// (model_swap_coalesce.go). Drain work can outlast the planning window,
+	// so claim against the current time rather than the heartbeat timestamp.
+	r.triggerModelSwapsFromHeartbeat(time.Now())
 }
 
 // SendLoadModel instructs a provider to eagerly load a model so it becomes
