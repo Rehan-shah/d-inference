@@ -98,8 +98,14 @@ extension CoordinatorClient {
             ? (config.apnsEnvironment ?? "production")
             : config.apnsEnvironment
 
+        // A drain (update / shutdown) outranks serving/idle: the box may still
+        // be decoding in-flight work, but it refuses new work, and the
+        // coordinator must stop selecting it now rather than after enough
+        // 503 bounces trip a cooldown.
+        let status: ProviderStatus = state.refusingNewWork
+            ? .draining : (isActive ? .serving : .idle)
         let message = CoordinatorClientCodec.heartbeatMessage(
-            status: isActive ? .serving : .idle,
+            status: status,
             activeModel: activeModel,
             warmModels: warmModels,
             stats: stats.snapshot(),
