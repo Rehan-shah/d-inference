@@ -1190,13 +1190,15 @@ func (r *Registry) scanCandidatesLocked(model string, pr *PendingRequest, ignore
 			// ignoreCapacityCooldown re-run of the shared gate keeps a pair that
 			// ALSO fails a structural gate out of the count; both checks are
 			// cheap and only run on the already-rare drop path.
-			if r.capacityCooldownActiveLocked(p.ID, model, now) {
-				p.mu.Lock()
-				otherwiseRoutable := r.providerPassesRoutingGatesLockedEx(p, model, pr.Traits, relaxTrust, now, ignoreProviderBreaker, true)
-				p.mu.Unlock()
-				if otherwiseRoutable {
-					capacityRejections++
-				}
+			// A draining provider (drain_state.go) is the same transient
+			// class: present, serving the model, back after its restart.
+			p.mu.Lock()
+			transient := r.capacityCooldownActiveLocked(p.ID, model, now) || providerDrainingLocked(p, now)
+			otherwiseRoutable := transient &&
+				r.providerPassesRoutingGatesLockedEx(p, model, pr.Traits, relaxTrust, now, ignoreProviderBreaker, true)
+			p.mu.Unlock()
+			if otherwiseRoutable {
+				capacityRejections++
 			}
 			continue
 		}
@@ -1704,7 +1706,13 @@ func (r *Registry) providerRoutingGateReasonLockedEx(p *Provider, model string, 
 	// keep winning the cost scheduler. A busy box that is also SERVING never
 	// trips this (any accept resets the streak), and the pair is re-probed once
 	// its TTL expires. See capacity_cooldown.go.
-	if !ignoreCapacityCooldown && r.capacityCooldownActiveLocked(p.ID, model, now) {
+	// A DRAINING provider (heartbeat status "draining" or a typed draining
+	// rejection — drain_state.go) rides the same transient branch: it refuses
+	// every dispatch until it restarts, so it is skipped here and counted as
+	// a capacityRejection by the scan/preflight re-check, never as absence.
+	// It is tallied under GateCapacityCooldown on the routing record.
+	if !ignoreCapacityCooldown &&
+		(r.capacityCooldownActiveLocked(p.ID, model, now) || providerDrainingLocked(p, now)) {
 		return false, GateCapacityCooldown
 	}
 	// Skip a provider quarantined by the per-provider node-health breaker: a
@@ -2829,7 +2837,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 			// never fit the hardware counts as modelTooLarge — never as
 			// transient capacity, or a fleet of undersized cooled boxes would
 			// read as "busy, retry" for a model that will never fit.
-			if r.capacityCooldownActiveLocked(p.ID, model, now) &&
+			if (r.capacityCooldownActiveLocked(p.ID, model, now) || providerDrainingLocked(p, now)) &&
 				r.providerPassesRoutingGatesLockedEx(p, model, traits, false, now, true, true) &&
 				p.SystemMetrics.ThermalState != "critical" &&
 				(!requiresVision || r.providerServesVisionModelLocked(p, model, false)) {

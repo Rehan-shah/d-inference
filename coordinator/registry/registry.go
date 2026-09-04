@@ -853,12 +853,22 @@ type Provider struct {
 	// distinguish "never enrolled" from "enrolled but unresponsive".
 	MDMFailureReason string
 
-	Status           ProviderStatus
-	Conn             *websocket.Conn
-	writer           *providerWriter
-	LastHeartbeat    time.Time
-	Stats            protocol.HeartbeatStats // lifetime counters shown to users
-	lastSessionStats protocol.HeartbeatStats // raw counters from the current provider process
+	Status ProviderStatus
+	// drainingUntil is non-zero while the provider has declared itself
+	// draining (heartbeat status "draining" or a typed draining rejection);
+	// routing skips it until a clearing heartbeat or the TTL (drain_state.go).
+	// drainingByRejection records that the current mark came from a typed
+	// draining REJECTION rather than a heartbeat: such a mark survives
+	// idle/serving heartbeats (a legacy provider that types the reason but
+	// not the status) and clears only by TTL or a "draining" heartbeat
+	// taking ownership. Guarded by p.mu.
+	drainingUntil       time.Time
+	drainingByRejection bool
+	Conn                *websocket.Conn
+	writer              *providerWriter
+	LastHeartbeat       time.Time
+	Stats               protocol.HeartbeatStats // lifetime counters shown to users
+	lastSessionStats    protocol.HeartbeatStats // raw counters from the current provider process
 
 	// Account linkage (set when provider authenticates via device auth token)
 	AccountID string // internal account ID (from device auth flow)
@@ -2357,6 +2367,16 @@ type Registry struct {
 	// wiping it (the prod zombie exploit: median 18 sessions/machine/week
 	// reset every session-keyed breaker before it could trip).
 	faultKeyBySession map[string]string
+	// identityVersions / inferenceErrorFlushStrikes back the version-changed
+	// reconnect reset (version_reset.go): the last binary version seen per
+	// stable identity, the time of its last reset (rate limit), and the subset
+	// of inferenceErrorStrikes that came from the disconnect flush (502) so
+	// exactly those can be removed when the identity returns on a new binary.
+	// Lazily created; guarded by r.mu; migrated on rebind; NOT cleared on
+	// Disconnect.
+	identityVersions           map[string]string
+	identityVersionResetAt     map[string]time.Time
+	inferenceErrorFlushStrikes map[inferenceErrorKey][]time.Time
 
 	// evictStrikes counts consecutive eviction sweeps a provider has been stale.
 	// A provider is only evicted after STALE on two sweeps in a row, so a single
@@ -4117,6 +4137,10 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	// loaded. Clear stale state so challenge checks never compare against a
 	// provider-injected identifier.
 	p.CurrentModel = currentModel
+	// Drain awareness (drain_state.go): "draining" arms the routing skip,
+	// "idle"/"serving" clear it. Independent of p.Status below — a draining
+	// provider keeps its online/serving accounting; only routing changes.
+	applyHeartbeatDrainStateLocked(p, msg.Status, now)
 	// Only update status from heartbeat if provider is not actively serving
 	// (serving status is managed by request lifecycle). Crucially, an
 	// untrusted provider must NOT transition back to StatusOnline here —
@@ -5001,8 +5025,19 @@ func mergeHeartbeatSessionStats(previous, current protocol.HeartbeatStats) proto
 	return merged
 }
 
-// Disconnect removes a provider from the registry and cleans up pending requests.
+// Disconnect removes a provider from the registry and cleans up pending
+// requests. This is the ABRUPT path: the flushed terminals carry
+// CoordinatorCauseProviderDisconnected and strike the provider's stable
+// identity. The provider read loop, which knows how the socket ended, calls
+// DisconnectWithReason (disconnect_reason.go) so a graceful peer close flushes
+// with the health-neutral restart cause instead.
 func (r *Registry) Disconnect(id string) {
+	r.disconnectWithCause(id, protocol.CoordinatorCauseProviderDisconnected)
+}
+
+// disconnectWithCause is the shared Disconnect implementation; cause is
+// stamped on every flushed pending-request terminal.
+func (r *Registry) disconnectWithCause(id string, cause protocol.CoordinatorInferenceErrorCause) {
 	var disconnectedModels []string
 	r.mu.Lock()
 	p, ok := r.providers[id]
@@ -5044,6 +5079,11 @@ func (r *Registry) Disconnect(id string) {
 			for key := range r.inferenceErrorCooldowns {
 				if key.ProviderID == id {
 					delete(r.inferenceErrorCooldowns, key)
+				}
+			}
+			for key := range r.inferenceErrorFlushStrikes {
+				if key.ProviderID == id {
+					delete(r.inferenceErrorFlushStrikes, key)
 				}
 			}
 			for key := range r.dispatchLoadCooldowns {
@@ -5104,7 +5144,8 @@ func (r *Registry) Disconnect(id string) {
 					RequestID:        reqID,
 					Error:            "provider disconnected",
 					StatusCode:       502,
-					CoordinatorCause: protocol.CoordinatorCauseProviderDisconnected,
+					ErrorReason:      disconnectFlushErrorReason(cause),
+					CoordinatorCause: cause,
 				}
 			}()
 			func() {

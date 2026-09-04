@@ -237,6 +237,12 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 	var schedulerSEKey string
 	var schedulerGeneration uint64
 
+	// peerCloseStatus is the close code the peer sent, captured by the read
+	// loop so the deferred teardown can flush pending requests with the
+	// health-neutral restart cause on a graceful 1000/1001 close and the
+	// striking abrupt cause otherwise (registry.ClassifyPeerClose). -1 = no
+	// close frame observed.
+	peerCloseStatus := websocket.StatusCode(-1)
 	// Cancel context for cleanup of the challenge loop goroutine.
 	loopCtx, loopCancel := context.WithCancel(ctx)
 	defer func() {
@@ -252,7 +258,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 		// provider down), so the measured reconnect gap starts here rather
 		// than at the last periodic coverage pass.
 		s.stopTrustCoverageForProvider(providerID)
-		s.registry.Disconnect(providerID)
+		s.registry.DisconnectWithReason(providerID, registry.ClassifyPeerClose(peerCloseStatus, false))
 		conn.Close(websocket.StatusNormalClosure, "goodbye")
 	}()
 
@@ -263,6 +269,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 			oomSuspected := false
 			readReason := readErrorReasonGeneric
 			if closeStatus != -1 {
+				peerCloseStatus = closeStatus
 				s.logger.Info("provider websocket closed",
 					"provider_id", providerID, "close_code", int(closeStatus))
 				// Peer-initiated closes were previously unmetered — only
@@ -437,11 +444,12 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 				}
 			}
 
-			// Store provider version.
+			// Store provider version. SetVersion also runs the version-changed
+			// reconnect reset for the session's stable identity, which the
+			// attestation bind above could not (the version was not stored
+			// yet) — see registry/version_reset.go.
 			if regMsg.Version != "" {
-				provider.Mu().Lock()
-				provider.Version = regMsg.Version
-				provider.Mu().Unlock()
+				provider.SetVersion(regMsg.Version)
 			}
 
 			// Verify runtime integrity against the known-good manifest. Swift

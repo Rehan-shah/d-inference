@@ -68,6 +68,16 @@ const (
 type providerHealthOutcome struct {
 	ts time.Time
 	ok bool
+	// flush marks a disconnect-flush (502) fault so a version-changed
+	// reconnect can drop exactly those entries (version_reset.go).
+	flush bool
+}
+
+// recordFault appends one FAULT outcome, tagging it as a disconnect flush
+// when it came from the registry's pending-request flush (status 502).
+func (w *providerHealthWindow) recordFault(now time.Time, flush bool) {
+	w.record(false, now)
+	w.outcomes[(w.head+providerHealthRingSize-1)%providerHealthRingSize].flush = flush
 }
 
 // providerHealthWindow is a fixed-size ring of the most recent
@@ -237,7 +247,7 @@ func (r *Registry) RecordProviderOutcome(providerID string, ok bool, statusCode 
 		return false, false
 	}
 	w := r.providerHealthWindowLocked(providerID)
-	w.record(false, now)
+	w.recordFault(now, statusCode == disconnectFlushStatusCode)
 
 	// Already open: the gate is derouting new traffic. In-flight faults are
 	// still recorded above, but must not re-arm until the cooldown elapses

@@ -174,7 +174,8 @@ func (r *Registry) bindStableFaultKey(sessionID, stableID string) {
 	// re-insert an entry Disconnect already removed (it would leak forever —
 	// nothing cleans that session id again). The disconnectedStableIDs cache
 	// covers post-disconnect resolution.
-	if _, live := r.providers[sessionID]; !live {
+	p, live := r.providers[sessionID]
+	if !live {
 		return
 	}
 	// Migrate accumulated fault state when the key changes: from the session id
@@ -192,6 +193,14 @@ func (r *Registry) bindStableFaultKey(sessionID, stableID string) {
 		r.migrateFaultStateLocked(old, stableID)
 	}
 	r.faultKeyBySession[sessionID] = stableID
+	// Version-changed reconnect reset (version_reset.go): a session that
+	// already reported its binary version binds here on re-attestation;
+	// registration-time binds happen before the version is stored and are
+	// covered by Provider.SetVersion. r.mu → p.mu is the established order.
+	p.mu.Lock()
+	version := p.Version
+	p.mu.Unlock()
+	r.noteIdentityVersionLocked(stableID, version)
 }
 
 // migrateFaultStateLocked re-keys every fault-tracking map entry from oldKey to
@@ -236,6 +245,23 @@ func (r *Registry) migrateFaultStateLocked(oldKey, newKey string) {
 			}
 			delete(r.inferenceErrorCooldowns, k)
 		}
+	}
+	// Disconnect-flush strike tags and the last-seen binary version follow
+	// the identity too (version_reset.go); an existing version under the new
+	// key is the more recent binding and wins.
+	for k, flush := range r.inferenceErrorFlushStrikes {
+		if k.ProviderID == oldKey {
+			nk := k
+			nk.ProviderID = newKey
+			r.inferenceErrorFlushStrikes[nk] = mergeChronologicalTimestamps(r.inferenceErrorFlushStrikes[nk], flush)
+			delete(r.inferenceErrorFlushStrikes, k)
+		}
+	}
+	if v, ok := r.identityVersions[oldKey]; ok {
+		if _, exists := r.identityVersions[newKey]; !exists {
+			r.identityVersions[newKey] = v
+		}
+		delete(r.identityVersions, oldKey)
 	}
 
 	// Node-health breaker.
@@ -470,7 +496,7 @@ func (r *Registry) RecordProviderServeOutcome(stableID string, ok bool, statusCo
 
 	if providerOutcomeIsFault(statusCode, errStr) {
 		w := r.healthEjectionWindowLocked(stableID)
-		w.record(false, now)
+		w.recordFault(now, statusCode == disconnectFlushStatusCode)
 
 		if until, had := r.healthEjectionUntil[stableID]; had && now.Before(until) {
 			return false, false // already ejected; in-flight faults don't re-arm until cooldown

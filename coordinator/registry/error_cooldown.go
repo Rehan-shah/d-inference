@@ -125,6 +125,11 @@ func (r *Registry) RecordInferenceError(providerID, modelID string, statusCode i
 	}
 	kept = append(kept, now)
 	r.inferenceErrorStrikes[key] = kept
+	// Tag the disconnect-flush strike so a version-changed reconnect can
+	// remove exactly it (version_reset.go).
+	if statusCode == disconnectFlushStatusCode {
+		r.noteInferenceFlushStrikeLocked(key, now)
+	}
 
 	if len(kept) < inferenceErrorThreshold {
 		return false

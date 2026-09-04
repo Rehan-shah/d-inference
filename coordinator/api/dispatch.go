@@ -923,7 +923,7 @@ func (d *dispatchState) providerFailedRoutingOutcomeFor(pr *registry.PendingRequ
 		return out
 	}
 	class := "provider_error"
-	if d.lastErrCoordinatorCause == protocol.CoordinatorCauseProviderDisconnected {
+	if d.lastErrCoordinatorCause.IsProviderDisconnect() {
 		class = "provider_disconnect_pre_commit"
 	}
 	out := d.errorRoutingOutcomeFor(pr, "error", class, d.lastErrCode)
@@ -1886,6 +1886,15 @@ func (d *dispatchState) shouldStopFailover() bool {
 		d.lastFailureDeadline = true
 		return false
 	case rejectionTransientCapacity:
+		if isDrainingErrorReason(d.lastErrReason) {
+			// Typed drain refusal (R2): the provider is restarting, not the
+			// fleet full. Keep failing over (the provider is now marked
+			// draining and excluded) WITHOUT charging the request's bounded
+			// transient-capacity allowance — a drain wave must not turn into
+			// 429s for requests the rest of the fleet can serve.
+			d.s.ddIncr("routing.dispatch_to_capacity_503", []string{"model:" + d.model, "reason:draining"})
+			return false
+		}
 		d.s.ddIncr("routing.dispatch_to_capacity_503", []string{"model:" + d.model, "reason:transient"})
 		d.capacityRetries++
 		if d.capacityRetries >= maxCapacityClassRetries {

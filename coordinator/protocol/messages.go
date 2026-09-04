@@ -87,6 +87,24 @@ const (
 // provider-swift/Sources/ProviderCore/Protocol/Types.swift.
 const ProviderDrainingForUpdate = "provider draining for update"
 
+// HeartbeatStatusDraining is the HeartbeatMessage.Status a provider reports
+// while it refuses new work ahead of a restart/update (the update drain, a
+// shutdown drain). The coordinator skips a draining provider in routing and
+// counts it as transient capacity (429 / queue material, never "no
+// providers"). Additive: older coordinators ignore unknown status strings and
+// older providers never send it. Mirrored in
+// provider-swift/Sources/ProviderCore/Protocol/ (ProviderStatus).
+const HeartbeatStatusDraining = "draining"
+
+// InferenceErrorReasonDraining is the InferenceErrorMessage.ErrorReason a
+// provider attaches (with failure_code "capacity", status 503) to an inference
+// request it refuses BECAUSE it is draining. The coordinator fails the request
+// over without consuming its transient-capacity retry allowance, derates no
+// gray-box capacity state for the pair, and marks the provider draining so
+// the next scan skips it even when the heartbeat status has not caught up.
+// Mirrored in provider-swift/Sources/ProviderCore/Protocol/ (InferenceErrorReason).
+const InferenceErrorReasonDraining = "draining"
+
 // PrefetchModelStatus is the lifecycle state reported by a provider in
 // response to a PrefetchModelMessage. Unlike a load, a prefetch only
 // downloads + verifies the model on disk; it does NOT load weights into

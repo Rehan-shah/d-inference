@@ -356,6 +356,18 @@ func (s *Server) noteInferenceError(providerID string, pr *registry.PendingReque
 	if isProviderHealthNeutralErrorReason(errReason) {
 		return
 	}
+	// Typed drain refusal (R2, registry/drain_state.go): the provider is
+	// restarting, not sick and not dishonest about capacity. It feeds NO
+	// breaker and NO gray-box capacity state (no cooldown strike, no rate
+	// derate, no budget clamp) — it marks the provider draining so routing
+	// skips it from the next scan on, which also covers a provider that sends
+	// the typed reason but not the "draining" heartbeat status.
+	if isDrainingErrorReason(errReason) {
+		if s.registry.MarkDraining(providerID) {
+			s.ddIncr("routing.provider_draining", []string{"model:" + pr.Model})
+		}
+		return
+	}
 	// Typed terminal-cause gate (the deadline-incident fix): the provider told
 	// us WHY the attempt died, so the status/string heuristics below must not
 	// misread a platform-policy terminal as sickness. Neutral causes touch no
