@@ -220,6 +220,17 @@ func TestCancelSendCountsOnlyDeliveredFrames(t *testing.T) {
 	requireMetricWithTags(t, packets, metricCancelledTerminal,
 		"outcome:"+cancelledOutcomeErrorCancelled, "cause:"+cancelCauseFirstChunkTimeout, "delivered:true")
 
+	// A stray chunk can win the initial enqueue while the abandon path is
+	// releasing registry capacity. Its later send is a resend, not another
+	// first cancel for this request.
+	srv.zombieCanceller.record("req-stray-first", model, cancelCauseClientGonePre, time.Now())
+	srv.noteStrayChunk(live, live.ID, "req-stray-first", time.Now())
+	srv.sendRecordedCancel(live, "req-stray-first", model, cancelCauseClientGonePre, time.Now())
+	packets = drain()
+	if got := sumMetric(t, packets, metricCancelSent, "cause:"+cancelCauseClientGonePre, "model:"+model); got != 1 {
+		t.Fatalf("a stray-first race must count one initial cancel, got %v: %v", got, packets)
+	}
+
 	// A live writer: counted on the first send, exactly once.
 	srv.sendAbandonCancel(live, "req-live", model, cancelCauseHedgeLoser)
 	packets = drain()

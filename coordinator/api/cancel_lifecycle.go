@@ -82,7 +82,13 @@ func (s *Server) sendRecordedCancel(provider *registry.Provider, requestID, mode
 		s.zombieCanceller.noteSendFailed(requestID, now)
 		return
 	}
-	s.zombieCanceller.markSent(requestID, time.Now())
+	resendIndex := s.zombieCanceller.markSent(requestID, time.Now())
+	if resendIndex > 0 {
+		// A stray chunk can deliver the first cancel while the abandon
+		// path releases capacity. This frame is then a resend too.
+		s.ddIncr(metricZombieStreamCancel, []string{"resend_index:" + strconv.Itoa(resendIndex)})
+		return
+	}
 	s.ddIncr(metricCancelSent, []string{"cause:" + cause, "model:" + modelTag(model)})
 }
 
