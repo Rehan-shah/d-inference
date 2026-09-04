@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 var versionMemoCorpus = []string{
@@ -71,28 +72,28 @@ func compareParsedVersions(as, bs []int) int {
 	return 0
 }
 
-// TestVersionMemoIsBoundedAndSelfHealing pins the memory bound: a stream of
-// distinct (garbage) versions never grows a memo past versionMemoCap, and
-// after the reset the real versions are memoized again and still correct.
-func TestVersionMemoIsBoundedAndSelfHealing(t *testing.T) {
-	versionSegmentsMemo.reset()
+// A full memo retains its hot entries and computes later versions correctly
+// without rebuilding. The saved map identity and allocation check catch the
+// old reset-and-regrow behavior even when every returned value is correct.
+func TestVersionMemoFullCachePreservesHotEntries(t *testing.T) {
+	var memo cowMemo[int]
+	compute := func(key string) int { return len(key) }
+	memo.get("0.8.15", compute)
+	for i := 1; i < versionMemoCap; i++ {
+		memo.get(fmt.Sprintf("9.%d.0", i), compute)
+	}
+	full := memo.entries.Load()
 	for i := 0; i < 3*versionMemoCap; i++ {
-		v := fmt.Sprintf("9.%d.%d", i, i%7)
-		if got, want := versionSegments(v), parseVersionSegments(v); !reflect.DeepEqual(got, want) {
-			t.Fatalf("versionSegments(%q) = %v, want %v", v, got, want)
+		key := fmt.Sprintf("10.%d.0", i)
+		if got := memo.get(key, compute); got != len(key) {
+			t.Fatalf("uncached version %q = %d, want %d", key, got, len(key))
 		}
-		if n := versionSegmentsMemo.size(); n > versionMemoCap {
-			t.Fatalf("memo grew to %d entries, cap %d", n, versionMemoCap)
+		if memo.entries.Load() != full || memo.size() != versionMemoCap || !memo.has("0.8.15") {
+			t.Fatal("a full memo discarded or rebuilt its cached entries")
 		}
 	}
-	// A real version is (re-)memoized after the flood and served from the memo.
-	before := versionSegmentsMemo.size()
-	_ = versionSegments("0.8.15")
-	if versionSegmentsMemo.size() != before+1 && versionSegmentsMemo.size() != 1 {
-		t.Fatalf("real version was not memoized after the flood (size %d → %d)", before, versionSegmentsMemo.size())
-	}
-	if got := versionSegments("0.8.15"); !reflect.DeepEqual(got, []int{0, 8, 15}) {
-		t.Fatalf("post-flood parse = %v", got)
+	if allocs := testing.AllocsPerRun(200, func() { memo.get("uncached", compute) }); allocs != 0 {
+		t.Fatalf("full-cache misses allocated %v per run; want 0 beyond the parser", allocs)
 	}
 }
 
@@ -173,6 +174,24 @@ func TestVersionMemoNeverRetainsOversizedVersions(t *testing.T) {
 	_ = versionSegments(atBound)
 	if !versionSegmentsMemo.has(atBound) {
 		t.Fatal("a key at the length bound must be memoized")
+	}
+}
+
+// A normalized core is a substring of the registration version. Retaining
+// that substring's storage would defeat the byte bound even though len(key)
+// is small; compare storage identity without dereferencing either pointer.
+func TestVersionMemoCopiesNormalizedKeyStorage(t *testing.T) {
+	var memo cowMemo[slotBudgetLayout]
+	version := "1.2.3+" + strings.Repeat("x", 1<<20)
+	core := versionNumericCore(version)
+	memo.get(core, parseSlotBudgetLayoutCore)
+	for key := range *memo.entries.Load() {
+		if key != core {
+			t.Fatalf("memo key = %q, want %q", key, core)
+		}
+		if unsafe.StringData(key) == unsafe.StringData(version) {
+			t.Fatal("short memo key retains the oversized version's backing storage")
+		}
 	}
 }
 

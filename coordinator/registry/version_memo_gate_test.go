@@ -2,16 +2,9 @@ package registry
 
 import "testing"
 
-// TestVersionMemosOnlySeeGatePassingProviders pins the reachability bound the
-// version memos' capacity policy relies on. Provider versions are supplied at
-// registration, but the routing scan parses one only AFTER the liveness/trust
-// gates: providerRoutingGateReasonLockedEx evaluates offline/untrusted/trust
-// floor/runtime-unverified before the trait-floor comparison, and
-// fillSnapshotPendingAndPool (the budget-layout selection) runs only for a
-// provider that passed every gate. So the memos' working set is the version
-// set of attested, runtime-verified advertisers — a handful of release
-// strings — not of registrations, and a provider below the hardware-trust
-// floor cannot push its version string into either memo through the scan.
+// TestVersionMemosOnlySeeGatePassingProviders pins that versions rejected by
+// the public trust gates never reach the routing scan's memos. The memo's
+// bounds do not depend on this: owner self-route may relax those gates.
 func TestVersionMemosOnlySeeGatePassingProviders(t *testing.T) {
 	versionSegmentsMemo.reset()
 	slotBudgetLayoutMemo.reset()

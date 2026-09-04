@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -20,15 +21,17 @@ import (
 // Bounds. Provider versions are attacker-supplied at registration, so the
 // memos are bounded in BOTH dimensions:
 //
-//   - count: at most versionMemoCap entries; when the cap is reached the memo
-//     is RESET rather than frozen, so a flood of garbage costs a rebuild
-//     (cheap) instead of permanently disabling caching for the real versions,
-//     which are re-memoized on their next use;
+//   - count: at most versionMemoCap entries; a full memo keeps its existing
+//     entries and computes misses without inserting or taking the writer lock.
+//     A diverse working set therefore cannot flush hot versions or repeatedly
+//     rebuild the map; later versions still parse correctly without caching;
 //   - bytes: a key longer than maxMemoizedVersionLen, or a parse with more
 //     than maxMemoizedVersionSegments segments, is computed but NEVER inserted
 //     (a valid "1.0.0+<multi-MiB metadata>" inside the frame limit could
 //     otherwise pin megabytes per entry). The worst case is therefore
-//     versionMemoCap × (64-byte key + 16-segment slice) ≈ tens of KiB.
+//     versionMemoCap × (64-byte key + 16-segment slice) ≈ tens of KiB. Keys
+//     are cloned on insertion so a short normalized core cannot keep the
+//     backing allocation of an oversized version suffix alive.
 //
 // The layout memo additionally keys on the NORMALIZED numeric core
 // ("1.0.0" for "v1.0.0-rc1+meta"), so suffix variants of one version share an
@@ -66,6 +69,9 @@ func (m *cowMemo[V]) getBounded(key string, compute func(string) V, keep func(V)
 		if v, ok := (*cur)[key]; ok {
 			return v
 		}
+		if len(*cur) >= versionMemoCap {
+			return compute(key)
+		}
 	}
 	v := compute(key)
 	if len(key) > maxMemoizedVersionLen || (keep != nil && !keep(v)) {
@@ -75,19 +81,22 @@ func (m *cowMemo[V]) getBounded(key string, compute func(string) V, keep func(V)
 	defer m.mu.Unlock()
 	cur := m.entries.Load()
 	var next map[string]V
-	if cur == nil || len(*cur) >= versionMemoCap {
+	if cur == nil {
 		next = make(map[string]V, 8)
 	} else {
 		if have, ok := (*cur)[key]; ok {
 			// Lost the insert race: hand back the shared value, not a duplicate.
 			return have
 		}
+		if len(*cur) >= versionMemoCap {
+			return v
+		}
 		next = make(map[string]V, len(*cur)+1)
 		for k, val := range *cur {
 			next[k] = val
 		}
 	}
-	next[key] = v
+	next[strings.Clone(key)] = v
 	m.entries.Store(&next)
 	return v
 }
