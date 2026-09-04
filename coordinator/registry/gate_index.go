@@ -158,9 +158,15 @@ func (r *Registry) gateOf(p *Provider) *gateState {
 // from, so the reads can be confirmed against the pointer afterwards. A value
 // type — the scan allocates nothing.
 //
-// The scan reads a gate lock-free (or under gate.mu for the per-model maps)
-// holding no lock a rebind respects, so a rebind that lands between the load
-// and the reads can leave the loaded gate saying nothing about the session:
+// A rebind runs under the session's p.mu (bindStableFaultKey's callers hold
+// it), so a read made under p.mu sees one p.gate for its whole section. Not
+// every dispatch-deciding read is made there — the candidate's capacity-rate
+// penalty (buildCandidateInto) is computed after the scan has released p.mu —
+// and the gate chain's p.mu is its caller's contract, not this file's, so the
+// reads are confirmed independently of that lock. Without it, a gate is read
+// lock-free (or under gate.mu for the per-model maps) holding nothing a rebind
+// respects, and a rebind that lands between the load and the reads can leave
+// the loaded gate saying nothing about the session:
 // migrateGateLocked moves the state to the session's new gate and, when the
 // source is SHARED with another live session, resets the source and
 // republishes it — zeros. A scan trusting that view would dispatch the

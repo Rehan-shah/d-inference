@@ -1920,6 +1920,7 @@ func (p *Provider) HardUntrustEpoch() uint64 {
 // marshal the Provider snapshot.
 func (p *Provider) SetAttestationResult(result *attestation.VerificationResult) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if result == nil {
 		p.AttestationResult = nil
 	} else {
@@ -1928,16 +1929,17 @@ func (p *Provider) SetAttestationResult(result *attestation.VerificationResult) 
 			[]string(nil), result.RuntimeCapabilities...)
 		p.AttestationResult = &snapshot
 	}
-	// Re-derive the stable identity while p.mu is held, then bind it OUTSIDE
-	// p.mu (bindStableFaultKey takes gatesMu and gate locks; keeping p.mu out
-	// of that section keeps the lock order simple). Binding at
-	// attestation time is what re-attaches a reconnecting machine's fault
-	// state (breakers/cooldowns keyed by serial/SE-key) to its fresh session
-	// id BEFORE it becomes routable — public routing requires attestation.
-	stableID, r := stableProviderIdentityLocked(p), p.registry
-	p.mu.Unlock()
-	if r != nil {
-		r.bindStableFaultKey(p, stableID)
+	// Re-derive the stable identity and bind it while p.mu is STILL held
+	// (lock order r.mu → p.mu → gatesMu → gate.mu; bindStableFaultKey takes the
+	// last two). The bind — which repoints p.gate — must not land inside a
+	// section that reads p.gate and acts on it under p.mu: the reservation
+	// commit's admit re-check through its pending debit, the scan's gate chain,
+	// the alias resolver's routability read. Binding at attestation time is what
+	// re-attaches a reconnecting machine's fault state (breakers/cooldowns keyed
+	// by serial/SE-key) to its fresh session id BEFORE it becomes routable —
+	// public routing requires attestation.
+	if r := p.registry; r != nil {
+		r.bindStableFaultKey(p, stableProviderIdentityLocked(p))
 	}
 }
 
@@ -1948,13 +1950,12 @@ func (p *Provider) SetAttestationResult(result *attestation.VerificationResult) 
 // identity resolves to the ACCOUNT fallback — attestation absent (Open Mode)
 // or invalid — would otherwise never bind: all its fault state would key by
 // session UUID and be wiped on reconnect. Same lock discipline as
-// SetAttestationResult: derive under p.mu, bind OUTSIDE it.
+// SetAttestationResult: derive AND bind under p.mu.
 func (p *Provider) RebindStableFaultKey() {
 	p.mu.Lock()
-	stableID, r := stableProviderIdentityLocked(p), p.registry
-	p.mu.Unlock()
-	if r != nil {
-		r.bindStableFaultKey(p, stableID)
+	defer p.mu.Unlock()
+	if r := p.registry; r != nil {
+		r.bindStableFaultKey(p, stableProviderIdentityLocked(p))
 	}
 }
 

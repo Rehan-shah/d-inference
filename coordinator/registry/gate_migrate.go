@@ -20,10 +20,13 @@ import "time"
 // double-count every fault (strike lists, health rings, consecutive-fault
 // streaks) the moment the sibling enriches to the same serial. The shared
 // source's reset is published (its atomics zeroed) so the sibling's readers
-// see the move at once; the routing readers confirm their view against
-// p.gate (gateView) so the rebinding session's own in-flight scan cannot
-// mistake the emptied source for its state, and the recorders re-validate
-// under gate.mu (lockGate) for the same reason.
+// see the move at once. A bind runs under the rebinding session's p.mu, so
+// the routing sections that hold p.mu (the scan's gate chain, the reservation
+// commit through its debit, the alias resolver) never observe the move
+// mid-section; the routing readers also confirm their view against p.gate
+// (gateView) so a read made without p.mu cannot mistake the emptied source
+// for the session's state, and the recorders re-validate under gate.mu
+// (lockGate) for the same reason.
 
 // resolve follows forwardTo to the gate that currently holds this identity's
 // state. Lock-free; one atomic load in the common (not migrated) case.
@@ -157,6 +160,17 @@ func (g *gateState) resetLocked() {
 // Only LIVE sessions bind: a re-attestation racing Disconnect must not
 // re-insert an entry Disconnect already removed. Liveness is the sessions
 // index under gatesMu, so this never takes r.mu.
+//
+// Caller holds p.mu (SetAttestationResult, RebindStableFaultKey; lock order
+// r.mu → p.mu → gatesMu → gate.mu). The bind repoints p.gate, and the routing
+// sections that read p.gate and ACT on the verdict do so under p.mu — the
+// reservation commit from its admit re-check through the pending debit
+// (commitProviderReservation, ReserveNextFromPlan), the scan's gate chain
+// (gateStateReasonLocked), the alias resolver's routability read
+// (providerCanRouteBuildLocked) — so with the bind under the same lock none
+// of them can accept a clean gate and then act after the session has moved
+// to an identity that is quarantined. The map-keyed implementation had this
+// for free (the bind and the commit shared r.mu.Lock).
 //
 // Accumulated fault state migrates when the key changes: from the session id
 // on the FIRST bind (strikes recorded pre-attestation live on the session

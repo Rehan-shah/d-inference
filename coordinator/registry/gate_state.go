@@ -29,7 +29,8 @@ import (
 // while holding gatesMu or a gate.mu. gatesMu is insert-only from the request
 // path's point of view: recorders and readers take it for READING (session →
 // gate resolution); it is written only by Register, Disconnect, the
-// attestation-time identity bind and the periodic sweep. Only the identity
+// attestation-time identity bind (under the session's p.mu) and the periodic
+// sweep. Only the identity
 // migration (migrateGateLocked, under gatesMu.Lock) ever holds two gate.mu at
 // once, so there is no ordering problem between gates. There is deliberately
 // NO walk-wide gates lock on the scan: a lock taken for the whole fleet walk
@@ -45,10 +46,15 @@ import (
 // releases, re-resolves through the index and retries. Everything that can
 // invalidate a resolved gate — the forward, the retire flag, the session's
 // repoint — is therefore written while holding that gate's mu. The routing
-// READS have the same window one layer down: the scan loads p.gate and reads
-// it holding no lock a rebind respects, so it confirms every verdict against
-// p.gate afterwards and re-reads from the session's new gate when it moved
-// (gateView, gate_index.go).
+// READS are covered two ways. A rebind runs under the session's p.mu
+// (bindStableFaultKey's callers hold it), so a read made under p.mu — the
+// scan's gate chain, the reservation commit from its admit re-check through
+// the pending debit, the alias resolver's routability read — never sees
+// p.gate move mid-section. Independently of that lock, every read that feeds
+// a dispatch decision confirms its verdict against p.gate afterwards and
+// re-reads from the session's new gate when it moved (gateView,
+// gate_index.go); that is what covers the candidate cost read the scan makes
+// after it has released p.mu.
 //
 // Sections under gate.mu must stay per identity and microseconds long.
 //
