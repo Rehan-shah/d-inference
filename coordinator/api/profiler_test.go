@@ -1266,3 +1266,56 @@ func TestRelayStampsCountOnlyWrittenBytes(t *testing.T) {
 		t.Fatal("clean stream must stamp done_flushed")
 	}
 }
+
+// TestRelayStampsCoalescedWriteCountsFrames pins the contract the chat relay's
+// batched flush relies on: one client write carrying several SSE frames
+// advances chunks_out by the frame count (the field keeps meaning "frames
+// delivered" whether or not chunks were coalesced), bytes_out by the accepted
+// bytes only, and a failed write flags client_write_err exactly as wrote does.
+func TestRelayStampsCoalescedWriteCountsFrames(t *testing.T) {
+	rp := registry.NewRequestProfile(time.Now(), "c", nil, 0)
+	rs := newRelayStamps(rp)
+	rs.wroteFrames(3, 100, nil)
+	if rp.ChunksOut.Load() != 3 || rp.BytesOut.Load() != 100 || rp.FirstFlushUS.Load() == 0 {
+		t.Fatalf("coalesced write: chunks=%d bytes=%d first_flush=%d, want 3/100/stamped",
+			rp.ChunksOut.Load(), rp.BytesOut.Load(), rp.FirstFlushUS.Load())
+	}
+	rs.wroteFrames(0, 0, nil) // an empty batch (relay.flush with nothing buffered) counts nothing
+	rs.wroteFrames(2, 0, errors.New("broken pipe"))
+	if rp.ChunksOut.Load() != 3 || rp.BytesOut.Load() != 100 || !rp.ClientWriteErr.Load() {
+		t.Fatalf("failed coalesced write must count nothing and flag client_write_err: chunks=%d bytes=%d err=%v",
+			rp.ChunksOut.Load(), rp.BytesOut.Load(), rp.ClientWriteErr.Load())
+	}
+	rs.wroteFrames(2, 10, errors.New("short")) // partial: the accepted bytes and the frames count, the error is kept
+	if rp.ChunksOut.Load() != 5 || rp.BytesOut.Load() != 110 || !rp.ClientWriteErr.Load() {
+		t.Fatalf("short coalesced write: chunks=%d bytes=%d err=%v",
+			rp.ChunksOut.Load(), rp.BytesOut.Load(), rp.ClientWriteErr.Load())
+	}
+	// wrote stays the one-frame case of the same accounting.
+	rs.wrote(4, nil)
+	if rp.ChunksOut.Load() != 6 || rp.BytesOut.Load() != 114 {
+		t.Fatalf("wrote after wroteFrames: chunks=%d bytes=%d, want 6/114", rp.ChunksOut.Load(), rp.BytesOut.Load())
+	}
+}
+
+// TestChatStreamRelayFlushReportsFramesAndBytes pins the relay side of the
+// same contract: flush returns the number of frames in the batch and the bytes
+// the ResponseWriter accepted, and an empty batch neither writes nor flushes.
+func TestChatStreamRelayFlushReportsFramesAndBytes(t *testing.T) {
+	rec := httptest.NewRecorder()
+	relay := newChatStreamRelay(&registry.PendingRequest{})
+	relay.writeFrame(`data: {"a":1}`)
+	relay.writeFrame(`data: {"b":2}`)
+	relay.writeFrame("data: [DONE]")
+	frames, n, err := relay.flush(rec, rec)
+	want := "data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n"
+	if err != nil || frames != 3 || n != len(want) || rec.Body.String() != want || !rec.Flushed {
+		t.Fatalf("flush = (%d frames, %d bytes, %v) body=%q flushed=%v; want (3, %d, nil) %q",
+			frames, n, err, rec.Body.String(), rec.Flushed, len(want), want)
+	}
+	rec2 := httptest.NewRecorder()
+	if frames, n, err := relay.flush(rec2, rec2); frames != 0 || n != 0 || err != nil || rec2.Flushed || rec2.Body.Len() != 0 {
+		t.Fatalf("empty flush = (%d, %d, %v) flushed=%v body=%d bytes; want zeros and no flush",
+			frames, n, err, rec2.Flushed, rec2.Body.Len())
+	}
+}
