@@ -182,6 +182,8 @@ func (s *Server) updateInferenceRouteOutcomeWithModel(requestID string, attempt 
 		return
 	}
 	s.emitInferenceErrorMetric(model, outcome)
+	s.emitAttemptOutcomeMetric(model, outcome)
+	s.emitCommittedRequestOutcomeORView(model, outcome)
 	s.emitTimingDecompositionMetric(model, outcome.FinalStatus, outcome)
 	// Off the request path: the batching sink pipelines this update with its
 	// neighbours after the group's route inserts (route_telemetry_submit.go).

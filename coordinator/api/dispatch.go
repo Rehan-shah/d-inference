@@ -782,6 +782,10 @@ func (d *dispatchState) resolveDominantExhaustedStatus(
 ) (statusCode int, reason string, timeoutReclassified bool, dominance exhaustedDominance) {
 	statusCode, reason, timeoutReclassified = classifyExhaustedStatus(
 		failure.statusCode, failure.terminalCause)
+	if timeoutReclassified && failure.errText == errQueueDeadlineExpired {
+		// Never dispatched: the synthetic timeout came from the queue wait.
+		reason = rejectionReasonQueueDeadline
+	}
 	switch {
 	case d.terminalClientError:
 		statusCode = d.terminalClientErrorCode
@@ -1174,7 +1178,12 @@ func (d *dispatchState) updateSpeculativeClientGone(pr *registry.PendingRequest)
 // backup bookkeeping (updateSpeculativeClientGone) never double-counts.
 func (d *dispatchState) emitClientGone(phase string) {
 	d.stampClientGone(phase)
-	d.s.emitClientGone(d.model, d.estimatedPromptTokens, providerChipFamily(d.provider), phase)
+	// deadline_bucket: elapsed on the request clock vs the first-content
+	// budget. At/past ~the budget the upstream timed out on us (its 504), so
+	// the OR-view outcome is `timeout`; earlier it is an excluded client abort.
+	bucket := d.clientGoneDeadlineBucket()
+	d.s.emitClientGoneBucketed(d.model, d.estimatedPromptTokens, providerChipFamily(d.provider), phase, bucket)
+	d.recordRequestOutcomeORView(orViewClassForClientGone(bucket))
 }
 
 // dispatchPrimary selects (and, when no idle provider exists on the first
@@ -1318,6 +1327,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 				s.recordRejection(d.rejectionInfoWithDecision("dispatch", "ttft_too_slow", http.StatusTooManyRequests, retryAfter*1000, decision))
 				d.recordDispatchedRequestOutcome(
 					d.kvBackendAttribution(), classifyOutcomeByCode(http.StatusTooManyRequests))
+				d.recordRequestOutcomeORView(classifyOutcomeByCode(http.StatusTooManyRequests))
 			}
 			s.writeTTFTTooSlow(w, d.model, d.publicModel, bestTTFT, d.deadline)
 			return outcomeResponseWritten
@@ -1463,10 +1473,17 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			}
 			if errors.Is(err, context.DeadlineExceeded) ||
 				errors.Is(err, registry.ErrQueueFirstContentDeadline) {
+				// The first-content clock ran out while the request was still
+				// queued: nothing was dispatched, so this is the queue's own
+				// terminal (queue_deadline), not a provider that went silent
+				// (first_chunk_timeout). Same synthetic 504 → retryable 429
+				// path; the distinct latched text is what
+				// resolveDominantExhaustedStatus keys the reason on. The route
+				// row and the attempt profile carry queue_deadline as well.
 				s.recordWarmPoolQueueState(d.model)
 				d.queuedExitOutcome(queuePR.Profile,
-					"timeout", "first_chunk_timeout", http.StatusGatewayTimeout)
-				d.setLastError("timeout waiting for first response", http.StatusGatewayTimeout)
+					"timeout", rejectionReasonQueueDeadline, http.StatusGatewayTimeout)
+				d.setLastError(errQueueDeadlineExpired, http.StatusGatewayTimeout)
 				return outcomeFailFast
 			}
 			if errors.Is(err, registry.ErrQueueTTFTTooSlow) {
@@ -1762,6 +1779,18 @@ func (d *dispatchState) noteProviderError(provider *registry.Provider, pr *regis
 // maxCapacityClassRetries). Distinct from the preflight "context_exceeded" /
 // "prompt_too_long" and the legacy dispatch-exhausted "unservable_token_budget".
 const rejectionReasonOversized = "oversized_request"
+
+// rejectionReasonQueueDeadline is the rejection-ledger reason_code for a
+// request whose request-absolute first-content clock expired while it was
+// still waiting in the coordinator queue. Nothing was dispatched — it is the
+// queue's own terminal, kept distinct from first_chunk_timeout (a dispatched
+// provider that produced no content in time) so telemetry stops conflating
+// queue expiry with provider silence. Same retryable 429 + Retry-After.
+const rejectionReasonQueueDeadline = "queue_deadline"
+
+// errQueueDeadlineExpired is the latched error text for that terminal; the
+// exhausted ladder keys the queue_deadline reason on it.
+const errQueueDeadlineExpired = "first-content deadline expired while queued for a provider"
 
 // rejectionReasonRoutingSaturated is the rejection-ledger reason_code for a
 // request shed because no provider-selection scan slot freed up within its
@@ -3407,7 +3436,14 @@ func (d *dispatchState) run() {
 		// in practice the loop ends at exhaustion or success; maxDispatchAttempts
 		// is only a hot-loop ceiling and this is the wall-clock bound.
 		if attempt > 0 && r.Context().Err() != nil {
-			goto exhausted
+			// The client left between attempts (D2). There is no in-flight
+			// provider (the previous attempt already cleaned up and wrote its
+			// own route outcome) and nobody to write a 429/5xx to, so record it
+			// as client_gone like every other pre-content cancel arm — not as
+			// the exhausted ladder's rate_limited / provider_5xx outcome.
+			d.refundReservation()
+			d.emitClientGone(phaseBeforeFirstToken)
+			return
 		}
 		if attempt > 0 && d.firstTokenExpired() {
 			// The request-absolute first-token budget is gone: the client must
@@ -3437,6 +3473,7 @@ func (d *dispatchState) run() {
 		if d.timing.RoutedAt.IsZero() {
 			d.timing.RoutedAt = time.Now()
 		}
+		d.emitRouteLatency()
 
 		s.ddIncr("routing.decisions", []string{"model:" + d.model, "outcome:selected"})
 		s.ddIncr("routing.provider_selected", []string{"provider_id:" + d.provider.ID, "model:" + d.model})
@@ -3510,7 +3547,7 @@ exhausted:
 		statusCode, reason, timeoutReclassified, dominance :=
 			d.resolveDominantExhaustedStatus(failure, stickyFault)
 		if timeoutReclassified {
-			s.ddIncr("routing.first_chunk_timeout_reclassified", []string{"model:" + d.model})
+			s.ddIncr("routing.first_chunk_timeout_reclassified", []string{"model:" + d.model, "reason:" + reason})
 		}
 		switch dominance {
 		case exhaustedClientError:
@@ -3580,6 +3617,7 @@ exhausted:
 		// OR-uptime outcome for a dispatched-but-failed request (exactly once;
 		// pre-dispatch rejections emit from recordRejection instead).
 		d.recordDispatchedRequestOutcome(kvBackend, classifyOutcomeByCode(statusCode))
+		d.recordRequestOutcomeORView(classifyOutcomeByCode(statusCode))
 		if statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable {
 			retryAfter := s.estimateRetryAfter(d.model)
 			if d.lastErrFeasibleAfterMS > 0 {

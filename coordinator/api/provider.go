@@ -1825,6 +1825,7 @@ func (s *Server) handleChunk(providerID string, provider *registry.Provider, msg
 		s.logger.Warn("chunk for unknown request", "provider_id", providerID)
 		s.ddIncr("inference.unknown_request_frames", []string{"kind:chunk"})
 		s.unknownRequestFrames.Add(1)
+		s.emitUnknownFrame(unknownFrameKindChunk, provider)
 		// The provider is still generating into a stream we abandoned (consumer
 		// gone / already settled), burning its GPU and token-budget admission.
 		// Nudge it to stop — throttled so a chunk-per-token zombie doesn't flood
@@ -2145,6 +2146,7 @@ func (s *Server) handleCompleteAt(
 		s.logger.Warn("complete for unknown request", "provider_id", providerID)
 		s.ddIncr("inference.unknown_request_frames", []string{"kind:complete"})
 		s.unknownRequestFrames.Add(1)
+		s.emitUnknownFrame(unknownFrameKindComplete, provider)
 		// A claimed terminal whose pending request a consumer-side cleanup
 		// removed in between: the provider completed, the coordinator lost
 		// ownership; close the record rather than leak the attempt.
@@ -2790,6 +2792,7 @@ func (s *Server) handleInferenceErrorOwned(providerID string, provider *registry
 		s.logger.Warn("error for unknown request", "provider_id", providerID)
 		s.ddIncr("inference.unknown_request_frames", []string{"kind:error"})
 		s.unknownRequestFrames.Add(1)
+		s.emitUnknownFrame(unknownFrameKindError, provider)
 		// A terminal claimed here whose pending request a consumer-side cleanup
 		// removed in between: the provider errored, the coordinator lost
 		// ownership; close the record rather than leak the attempt. An owned
