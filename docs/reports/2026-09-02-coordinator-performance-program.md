@@ -1,5 +1,7 @@
 # Coordinator performance program — 2026-09-02
 
+> Last updated: 2026-09-02 · commit `5508b4f84`
+
 Status: complete, awaiting review/push (branch `worktree-bridge-cse_01TuyfD42fkRyG4ZqSTmeN4U`, based on master `a1f51ea4c`).
 
 This report is the first-principles pass over every coordinator operation with a
