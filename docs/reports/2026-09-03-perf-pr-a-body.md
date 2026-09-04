@@ -100,9 +100,10 @@ added removed. Conflicts and the semantic hazards from
 | `AGENTS.md` | — | the perf branch's "per-model provider index" invariant (a `registry/model_index.go` contract) is dropped here; it returns with PR B. |
 
 Profiler semantics note (for the system-profiler docs): the held finish/usage
-frames' bytes now count in `bytes_out` (master stamped only the extras and
-`[DONE]` frames), and `first_flush_us` / `max_chunk_gap_us` are stamped per
-flush — which is when the bytes reach the wire.
+frames now count in `chunks_out` and `bytes_out` (master's #809 wrote them
+without an `rs.wrote`, stamping only the extras and `[DONE]` frames — an
+undercount this fixes), and `first_flush_us` / `max_chunk_gap_us` are stamped
+per flush — which is when the bytes reach the wire.
 
 ## Measurements
 
