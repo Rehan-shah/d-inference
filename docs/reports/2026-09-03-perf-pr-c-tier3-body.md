@@ -1,5 +1,7 @@
 # perf(registry): take the global write lock off the per-request path (Tier 3)
 
+> Last updated: 2026-09-04 · commit `bacbf95d0`
+
 Stacks on `perf/coordinator-registry-scan-2026-09-03` (PR B: per-model index, arena snapshots,
 cached medians). **Merge after it and after PR #818** (`perf/coordinator-tier1-2026-09-03`, the
 `lockWrite(site)` observer and `ScanCount` stamp); this branch is rebased onto #818 once it lands —
