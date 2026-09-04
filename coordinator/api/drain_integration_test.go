@@ -198,11 +198,12 @@ func TestDrain_LegacyCapacityBusyControl_StillBounded(t *testing.T) {
 	}
 }
 
-// TestDrain_TypedRejectionSurvivesIdleHeartbeat: a provider that types the
-// draining reason but keeps reporting "idle" (legacy heartbeat) stays skipped
-// after its heartbeat — the mark clears by TTL or a draining-then-idle
-// heartbeat pair, not by a stale idle.
-func TestDrain_TypedRejectionSurvivesIdleHeartbeat(t *testing.T) {
+// TestDrain_TypedRejectionClearedByIdleHeartbeat: a provider whose drain the
+// coordinator learned from the typed rejection alone (its "draining" event
+// heartbeat never landed) reports idle once the drain aborts — the mark
+// clears on that heartbeat and the provider is routable again, rather than
+// staying excluded until the 150 s TTL.
+func TestDrain_TypedRejectionClearedByIdleHeartbeat(t *testing.T) {
 	reg, _, ts := setupFailoverServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -237,16 +238,22 @@ func TestDrain_TypedRejectionSurvivesIdleHeartbeat(t *testing.T) {
 		defer p.Mu().Unlock()
 		return p.LastHeartbeat.After(lastHB)
 	}, "idle heartbeat processed")
-	if !reg.ProviderDraining(pA.registryID) {
-		t.Fatalf("idle heartbeat cleared a rejection-set drain mark")
+	if reg.ProviderDraining(pA.registryID) {
+		t.Fatalf("rejection-set drain mark survived the provider's idle heartbeat")
 	}
 
+	// Routable again: the fast box is selected first and (still scripted to
+	// refuse) types the reason once more, re-marking itself for exactly one
+	// bounce before B serves.
 	status, body, err = postChat(ctx, ts.URL, "test-key", buildChatBody(t, model, true, nil))
 	if err != nil {
 		t.Fatalf("second chat request: %v", err)
 	}
 	assertCleanFailoverStream(t, status, body, markerFor("provider-b"))
-	if got := pA.dispatchCount(); got != 1 {
-		t.Errorf("provider-a dispatches = %d, want 1 (still skipped after the idle heartbeat)", got)
+	if got := pA.dispatchCount(); got != 2 {
+		t.Errorf("provider-a dispatches = %d, want 2 (routable again after the idle heartbeat)", got)
+	}
+	if !reg.ProviderDraining(pA.registryID) {
+		t.Fatalf("second typed refusal did not re-mark provider-a draining")
 	}
 }

@@ -88,11 +88,12 @@ func TestHeartbeatDraining_SkipsProviderAndCountsAsCapacity(t *testing.T) {
 	}
 }
 
-// A mark set by the typed draining REJECTION must survive idle/serving
-// heartbeats (a legacy provider that types the reason but not the status);
-// it clears on TTL or when a "draining" heartbeat takes ownership and then
-// reports idle.
-func TestMarkDraining_SurvivesIdleHeartbeat_ClearsOnTTL(t *testing.T) {
+// A mark set by the typed draining REJECTION is cleared by the provider's
+// own idle/serving heartbeat like a heartbeat-set one: the rejection is only
+// emitted by a binary that also reports "draining", so an update drain that
+// aborted before its draining heartbeat was delivered is back in routing on
+// the next heartbeat. The TTL remains the heartbeat-loss fallback.
+func TestMarkDraining_ClearedByIdleHeartbeat_OrTTL(t *testing.T) {
 	r := New(testLogger())
 	p := registerDrainStateProvider(t, r, "a", 200)
 
@@ -102,32 +103,45 @@ func TestMarkDraining_SurvivesIdleHeartbeat_ClearsOnTTL(t *testing.T) {
 	if r.MarkDraining("a") {
 		t.Fatalf("second MarkDraining reported a transition")
 	}
-	r.Heartbeat("a", drainStateHeartbeat("idle"))
-	if !r.ProviderDraining("a") {
-		t.Fatalf("rejection-set drain mark was cleared by an idle heartbeat")
-	}
 	if candidates, rejections, _ := r.QuickCapacityCheck(drainStateTestModel, 500, 64, RequestTraits{}); candidates != 0 || rejections != 1 {
 		t.Errorf("QuickCapacityCheck while marked = (%d, %d), want (0, 1)", candidates, rejections)
 	}
+	// A legacy/unknown status leaves the mark alone.
+	r.Heartbeat("a", drainStateHeartbeat(""))
+	if !r.ProviderDraining("a") {
+		t.Fatalf("rejection-set drain mark cleared by a heartbeat without a status")
+	}
+	// The aborted-drain case: the provider never reported "draining" and now
+	// reports idle. Routing must see it again immediately.
+	r.Heartbeat("a", drainStateHeartbeat("idle"))
+	if r.ProviderDraining("a") {
+		t.Fatalf("rejection-set drain mark survived the provider's idle heartbeat")
+	}
+	if candidates, rejections, _ := r.QuickCapacityCheck(drainStateTestModel, 500, 64, RequestTraits{}); candidates != 1 || rejections != 0 {
+		t.Errorf("QuickCapacityCheck after the idle heartbeat = (%d, %d), want (1, 0)", candidates, rejections)
+	}
 
 	// TTL expiry restores eligibility without any heartbeat.
+	if !r.MarkDraining("a") {
+		t.Fatalf("re-mark after the clear did not report a transition")
+	}
 	p.mu.Lock()
 	p.drainingUntil = time.Now().Add(-time.Second)
 	p.mu.Unlock()
 	if r.ProviderDraining("a") {
 		t.Fatalf("drain mark still honored past its TTL")
 	}
-	if candidates, rejections, _ := r.QuickCapacityCheck(drainStateTestModel, 500, 64, RequestTraits{}); candidates != 1 || rejections != 0 {
-		t.Errorf("QuickCapacityCheck after TTL = (%d, %d), want (1, 0)", candidates, rejections)
-	}
 
-	// A "draining" heartbeat takes ownership of a rejection mark, so the
-	// provider's own idle/serving report clears it afterwards.
+	// Rejection then "draining" then "serving": the provider's own report
+	// clears it in this order too.
 	r.MarkDraining("a")
 	r.Heartbeat("a", drainStateHeartbeat(protocol.HeartbeatStatusDraining))
+	if !r.ProviderDraining("a") {
+		t.Fatalf("draining heartbeat did not keep the mark")
+	}
 	r.Heartbeat("a", drainStateHeartbeat("serving"))
 	if r.ProviderDraining("a") {
-		t.Fatalf("heartbeat-owned drain mark not cleared by a serving heartbeat")
+		t.Fatalf("drain mark not cleared by a serving heartbeat")
 	}
 }
 

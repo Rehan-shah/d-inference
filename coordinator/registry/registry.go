@@ -856,19 +856,14 @@ type Provider struct {
 	Status ProviderStatus
 	// drainingUntil is non-zero while the provider has declared itself
 	// draining (heartbeat status "draining" or a typed draining rejection);
-	// routing skips it until a clearing heartbeat or the TTL (drain_state.go).
-	// drainingByRejection records that the current mark came from a typed
-	// draining REJECTION rather than a heartbeat: such a mark survives
-	// idle/serving heartbeats (a legacy provider that types the reason but
-	// not the status) and clears only by TTL or a "draining" heartbeat
-	// taking ownership. Guarded by p.mu.
-	drainingUntil       time.Time
-	drainingByRejection bool
-	Conn                *websocket.Conn
-	writer              *providerWriter
-	LastHeartbeat       time.Time
-	Stats               protocol.HeartbeatStats // lifetime counters shown to users
-	lastSessionStats    protocol.HeartbeatStats // raw counters from the current provider process
+	// routing skips it until its next idle/serving heartbeat or the TTL
+	// (drain_state.go). Guarded by p.mu.
+	drainingUntil    time.Time
+	Conn             *websocket.Conn
+	writer           *providerWriter
+	LastHeartbeat    time.Time
+	Stats            protocol.HeartbeatStats // lifetime counters shown to users
+	lastSessionStats protocol.HeartbeatStats // raw counters from the current provider process
 
 	// Account linkage (set when provider authenticates via device auth token)
 	AccountID string // internal account ID (from device auth flow)

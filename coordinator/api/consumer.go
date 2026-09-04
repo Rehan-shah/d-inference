@@ -413,8 +413,9 @@ func (s *Server) noteInferenceError(providerID string, pr *registry.PendingReque
 	// restarting, not sick and not dishonest about capacity. It feeds NO
 	// breaker and NO gray-box capacity state (no cooldown strike, no rate
 	// derate, no budget clamp) — it marks the provider draining so routing
-	// skips it from the next scan on, which also covers a provider that sends
-	// the typed reason but not the "draining" heartbeat status.
+	// skips it from the next scan on, which also covers a drain whose event
+	// heartbeat has not landed yet; the provider's next idle/serving
+	// heartbeat clears the mark either way.
 	if isDrainingErrorReason(errReason) {
 		if s.registry.MarkDraining(providerID) {
 			s.ddIncr("routing.provider_draining", []string{"model:" + pr.Model})
