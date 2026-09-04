@@ -1,6 +1,6 @@
 # Telemetry inventory
 
-> Last updated: 2026-09-04 · commit `aa87a0ebd`
+> Last updated: 2026-09-04 · commit `73df54ad0`
 
 Every datum the system collects today, with its producer, sink, cadence and
 retention. Anything not on this page is not emitted by the code at this commit.
@@ -96,6 +96,8 @@ lists every name).
 | `inference.typed_terminal` / `inference.typed_terminal_unknown_cause` | count | `cause` / — | each provider error terminal |
 | `inference.invalid_failure_code`, `inference.in_band_error`, `inference.first_content_after_deadline`, `inference.speculative_dispatch`, `inference.speculative_win`, `inference.zombie_stream_cancel`, `inference.chunk_overflow_abort` | count | various | dispatch edge cases (`coordinator/api/dispatch.go`, `provider.go`) |
 | `inference.prompt_tokens`, `inference.completion_tokens` (histogram); `inference.prompt_tokens_total`, `inference.completion_tokens_total` (count) | — | `model` | each completion |
+| `registry.mu.write_wait_ms` | histogram | `site` | Registry write-lock acquisition wait, emitted after unlock (`coordinator/registry/lock_wait.go`, `lockWrite`); dispatch-load failure and recovery are separate sites. |
+| `routing.scans` | count | `model`, `outcome` | Full reservation scans including retries (`coordinator/api/dispatch.go`, `recordRoutingDecisionFor`). |
 | `routing.decisions` | count | `model`, `model_type`, `outcome` (`selected`, `queued`, `model_shed`, `ttft_429`, `model_too_large`, `over_capacity`, `routing_saturated`, `capacity_queue_spill`, `capacity_429`, `cold_dispatch_spill`, `dedicated_capacity_429`, `no_eligible_provider`, `ttft_soft_served`, `unservable_429`) | each admission decision |
 | `inference.attempt_outcome`, `inference.queue_outcome` | count | `model`, `class` | dispatched-attempt and queue-only outcomes kept separate (`coordinator/api/attempt_outcome_metrics.go`, `emitAttemptOutcomeMetric`) |
 | `inference.unknown_frames` | count | `kind`, `provider_version` | unrecognized chunk/complete/error frames (`coordinator/api/unknown_frame_metrics.go`, `emitUnknownFrame`) |

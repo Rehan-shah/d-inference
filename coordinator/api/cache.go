@@ -18,6 +18,8 @@ import (
 type ttlCache struct {
 	mu   sync.RWMutex
 	data map[string]ttlEntry
+	// generation orders guarded fills against invalidation.
+	generation uint64
 }
 
 type ttlEntry struct {
@@ -79,6 +81,7 @@ func (c *ttlCache) SetValue(key string, v any, ttl time.Duration) {
 func (c *ttlCache) Invalidate(key string) {
 	c.mu.Lock()
 	delete(c.data, key)
+	c.generation++
 	c.mu.Unlock()
 }
 
@@ -143,10 +146,4 @@ func (s *Server) readCacheGetValue(key string) (any, bool) {
 		return nil, false
 	}
 	return s.readCache.GetValue(key)
-}
-
-func (s *Server) readCacheSetValue(key string, v any, ttl time.Duration) {
-	if s.readCache != nil {
-		s.readCache.SetValue(key, v, ttl)
-	}
 }

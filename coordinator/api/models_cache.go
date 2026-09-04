@@ -16,9 +16,8 @@ import (
 
 // modelListCacheTTL bounds staleness of the public model list. It carries live
 // capacity fields (routable/warm providers, can_accept), so it matches the 2s
-// window GET /v1/models/capacity already uses. Alias/registry admin changes
-// become visible within the same bound: these keys are TTL-only until
-// SyncModelCatalog's invalidateCatalogCache (server.go) learns to drop them.
+// window GET /v1/models/capacity already uses. Catalog sync invalidates these
+// entries and prevents an older in-flight fill from publishing afterward.
 const modelListCacheTTL = 2 * time.Second
 
 func modelEntriesCacheKey(includeBuilds bool) string {
@@ -39,11 +38,12 @@ func (s *Server) cachedModelEntries(includeBuilds bool) ([]types.ModelEntry, err
 			return entries, nil
 		}
 	}
+	generation := s.readCacheGeneration()
 	entries, err := s.listModelEntries(includeBuilds)
 	if err != nil {
 		return nil, err
 	}
-	s.readCacheSetValue(key, entries, modelListCacheTTL)
+	s.readCacheSetEntryIfCurrent(key, ttlEntry{obj: entries}, modelListCacheTTL, generation)
 	return entries, nil
 }
 
@@ -57,6 +57,7 @@ func (s *Server) cachedModelListBody(includeBuilds bool) ([]byte, error) {
 	if body, ok := s.readCacheGet(key); ok {
 		return body, nil
 	}
+	generation := s.readCacheGeneration()
 	entries, err := s.listModelEntries(includeBuilds)
 	if err != nil {
 		return nil, err
@@ -65,7 +66,7 @@ func (s *Server) cachedModelListBody(includeBuilds bool) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.readCacheSetValue(modelEntriesCacheKey(includeBuilds), entries, modelListCacheTTL)
-	s.readCacheSet(key, body, modelListCacheTTL)
+	s.readCacheSetEntryIfCurrent(modelEntriesCacheKey(includeBuilds), ttlEntry{obj: entries}, modelListCacheTTL, generation)
+	s.readCacheSetEntryIfCurrent(key, ttlEntry{value: body}, modelListCacheTTL, generation)
 	return body, nil
 }

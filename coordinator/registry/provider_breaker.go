@@ -200,8 +200,8 @@ func (r *Registry) RecordProviderOutcome(providerID string, ok bool, statusCode 
 		return false, false
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	hold := r.lockWrite("breaker")
+	defer hold.unlock()
 	// Recheck under the mutation lock: a version reset can race any API-side check.
 	if !ok && statusCode == disconnectFlushStatusCode && r.supersededDisconnectFlushLocked(providerID) {
 		return false, false

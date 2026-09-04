@@ -421,6 +421,13 @@ type RoutingDecision struct {
 	// PendingForModel / TotalPending are the winner's coordinator-side pending
 	// counts (this model / all models) at snapshot time, before this reservation.
 	PendingForModel, TotalPending int
+	// ScanCount is how many candidate scans this reservation attempt ran —
+	// one for a clean commit, more when a commit had to rescan (winner gone
+	// or full between scan and commit, cache-routing reconfiguration). Zero
+	// for a plan-based retry, which reuses the previous scan. The api layer
+	// emits it as the routing.scans counter so scan CPU per attempt is
+	// measured, not inferred from the profile.
+	ScanCount int
 	// LockWaitUS / ScanUS / AdmitUS are the three phases of ReserveProviderEx:
 	// waiting for r.mu, the candidate scan + selection (+ shadow evaluation),
 	// and the admit re-check under p.mu. Microseconds.
@@ -515,14 +522,17 @@ func (r *Registry) reserveProvider(model string, pr *PendingRequest, wantPlan bo
 	carried := RoutingDecision{Model: model}
 	var last providerReservationScan
 	var admitUS int64
+	scans := 0
 	failedDecision := func() RoutingDecision {
 		decision := routingDecisionForFailedScan(model, last.candidates)
 		addRoutingRejections(&decision, carried)
 		decision.LockWaitUS, decision.ScanUS, decision.AdmitUS = last.lockWaitUS, last.scanUS, admitUS
+		decision.ScanCount = scans
 		return decision
 	}
 	for pr.RefreshFirstContentBudget(time.Now()) {
 		last = r.scanProviderReservation(model, pr, excluded...)
+		scans++
 		if last.selected == nil {
 			return nil, failedDecision(), nil
 		}
@@ -547,6 +557,7 @@ func (r *Registry) reserveProvider(model string, pr *PendingRequest, wantPlan bo
 				model, provider, candidate, last.candidates)
 			addRoutingRejections(&decision, carried)
 			decision.LockWaitUS, decision.ScanUS, decision.AdmitUS = last.lockWaitUS, last.scanUS, admitUS
+			decision.ScanCount = scans
 			r.currentTTFTShadow(
 				model, pr, candidate, excluded...).applyTo(&decision)
 			var plan *DispatchPlan
@@ -638,8 +649,8 @@ func (r *Registry) commitProviderReservation(
 	scan providerReservationScan,
 	excludeIDs ...string,
 ) (*Provider, *routingCandidate, reservationCommitOutcome, RoutingDecision) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	hold := r.lockWrite("commit")
+	defer hold.unlock()
 
 	// The shared scan and write-lock wait consume the same absolute request
 	// clock as queueing and provider handoff. Never debit capacity for work whose

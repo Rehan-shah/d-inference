@@ -485,8 +485,8 @@ func (r *Registry) RecordProviderServeOutcome(stableID string, ok bool, statusCo
 	if stableID == "" || !healthEjectionEnabled() {
 		return false, false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	hold := r.lockWrite("health_ejection")
+	defer hold.unlock()
 	return r.recordProviderServeOutcomeLocked(stableID, ok, statusCode, errStr)
 }
 
@@ -496,8 +496,8 @@ func (r *Registry) RecordProviderSessionServeOutcome(sessionID string, ok bool, 
 	if sessionID == "" || !healthEjectionEnabled() {
 		return false, false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	hold := r.lockWrite("health_ejection")
+	defer hold.unlock()
 	if !ok && statusCode == disconnectFlushStatusCode && r.supersededDisconnectFlushLocked(sessionID) {
 		return false, false
 	}

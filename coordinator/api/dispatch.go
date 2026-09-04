@@ -444,6 +444,12 @@ func (d *dispatchState) recordRoutingDecisionFor(provider *registry.Provider, pr
 		keyID = pr.KeyID
 	}
 
+	// Scans per attempt (rescans included). Plan-based retries reuse the
+	// previous scan and report zero, which is not emitted.
+	if decision.ScanCount > 0 {
+		s.ddCount("routing.scans", int64(decision.ScanCount), []string{"model:" + d.model, "outcome:" + outcome})
+	}
+
 	record := &store.InferenceRouteRecord{
 		RequestID:               requestID,
 		Attempt:                 attempt,
@@ -599,12 +605,33 @@ func (d *dispatchState) commitFirstContent(pr *registry.PendingRequest, chunk st
 	// legitimately sheds concurrent dispatches — waiting for the completion
 	// accept (noteInferenceSuccess) would let transient fullness masquerade as
 	// the zero-accepts black-hole signature. See registry/capacity_cooldown.go.
-	// The return says whether the pair's capacity-503 RATE window stored this
-	// accept. The enabled tracker retains it even before the first reject; stamp
-	// the request so completion cannot add the same denominator outcome twice.
-	if d.s.registry.RecordCapacityAccept(pr.ProviderID, pr.Model) {
-		pr.MarkRateOutcomeCounted()
+	//
+	// The recorder takes the registry WRITE lock, which in production waits
+	// behind every queued writer (~190 ms at the median, seconds at the tail),
+	// and this runs BEFORE the chunk is written to the client. It is pure
+	// bookkeeping, so it runs off this goroutine and the first byte no longer
+	// waits for it. Exactly-once for the capacity-503 RATE window is kept by
+	// stamping the request BEFORE the recorder runs: the completion-time
+	// re-offer (noteInferenceSuccess) fires only for an unstamped request, and
+	// the recorder declines to store an offered accept only when rate tracking
+	// is disabled (PenaltyMs <= 0) — in which case the completion re-offer
+	// would store nothing either. So the unconditional stamp never loses an
+	// outcome and never double counts.
+	//
+	// The accept carries the instant it was OBSERVED — the first content
+	// chunk, stamped above by MarkFirstContentArrived — not the instant the
+	// goroutine finally holds the lock: a capacity reject for the same pair
+	// recorded in between happened AFTER this accept and must survive it
+	// (registry.RecordCapacityAcceptObserved).
+	pr.MarkRateOutcomeCounted()
+	providerID, model := pr.ProviderID, pr.Model
+	observedAt := pr.FirstContentAtSafe()
+	if observedAt.IsZero() {
+		observedAt = time.Now()
 	}
+	saferun.Go(d.s.logger, "api.recordCapacityAccept", func() {
+		d.s.registry.RecordCapacityAcceptObserved(providerID, model, observedAt, true)
+	})
 }
 
 func (d *dispatchState) successRoutingOutcomeFor(pr *registry.PendingRequest) *store.InferenceRouteOutcome {
@@ -3773,7 +3800,9 @@ func (d *dispatchState) writeCommittedResponse() {
 		// a set value here. No re-stamp needed; just read it for the reputation
 		// latency sample.
 		sample := adjustLatencyForPrefill(contentLatency(pr.Timing), pr.EstimatedPromptTokens, provider.PrefillTPS)
-		s.registry.RecordLatency(provider.ID, sample)
+		// Provider-level: p.mu only. The registry-level form looks the
+		// provider up under r.mu, and this runs before the first client write.
+		provider.RecordLatency(sample)
 	}
 
 	// Write provider attestation headers now that we're committed. When the
