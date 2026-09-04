@@ -72,13 +72,18 @@ func (s *Server) sendAbandonCancel(provider *registry.Provider, requestID, model
 }
 
 // sendRecordedCancel sends the cancel for a request already recorded in the
-// zombie tracker, marking the send so the re-send schedule is anchored.
+// zombie tracker. The send is marked and counted on inference.cancel_sent only
+// once the frame was handed to the provider writer: a control lane that is
+// full or a writer that has stopped delivered nothing, so the entry is kept
+// unsent (sent == 0) for the next stray chunk to retry, and a terminal that
+// arrives meanwhile is not reported as cancel-to-terminal.
 func (s *Server) sendRecordedCancel(provider *registry.Provider, requestID, model, cause string, now time.Time) {
-	s.zombieCanceller.markSent(requestID, now)
-	s.ddIncr(metricCancelSent, []string{"cause:" + cause, "model:" + modelTag(model)})
 	if !s.sendProviderCancel(provider, requestID) {
 		s.zombieCanceller.noteSendFailed(requestID, now)
+		return
 	}
+	s.zombieCanceller.markSent(requestID, now)
+	s.ddIncr(metricCancelSent, []string{"cause:" + cause, "model:" + modelTag(model)})
 }
 
 // cancelSendFailureReason maps an EnqueueText error to a bounded tag value.
@@ -121,30 +126,44 @@ func (s *Server) noteStrayChunk(provider *registry.Provider, providerID, request
 	if !res.send {
 		return
 	}
-	if res.resendIndex == 0 {
-		// First cancel ever for this id (normally cause stray_chunk; an abandon
-		// path's own send may also lose this race by microseconds).
-		s.ddIncr(metricCancelSent, []string{"cause:" + res.cause, "model:" + modelTag(res.model)})
-	}
 	if !s.sendProviderCancel(provider, requestID) {
 		s.zombieCanceller.noteSendFailed(requestID, now)
+		return
 	}
-	s.ddIncr(metricZombieStreamCancel, []string{"resend_index:" + strconv.Itoa(res.resendIndex)})
+	resendIndex := s.zombieCanceller.markSent(requestID, now)
+	if resendIndex < 0 {
+		// Untracked (zero-value Server): the frame went out, nothing to count.
+		return
+	}
+	if resendIndex == 0 {
+		// First cancel DELIVERED for this id: cause stray_chunk when no abandon
+		// path recorded one, or the abandon path's cause when its own send
+		// never reached the writer (or lost this race by microseconds).
+		s.ddIncr(metricCancelSent, []string{"cause:" + res.cause, "model:" + modelTag(res.model)})
+	}
+	s.ddIncr(metricZombieStreamCancel, []string{"resend_index:" + strconv.Itoa(resendIndex)})
 }
 
 // resolveCancelledTerminal correlates a provider terminal that found no live
-// pending record with the cancel the coordinator sent for it. Metric-only:
+// pending record with the cancel the coordinator recorded for it. Metric-only:
 // billing for a parked post-commit record still settles in the caller, and a
 // pre-commit attempt was refunded when it was abandoned. Returns the entry so
 // the caller can classify the terminal instead of logging it as unknown.
+// inference.cancelled_terminal is tagged delivered:false when no cancel ever
+// reached the provider writer (every enqueue failed): the provider finished
+// on its own, and the cancel→terminal latency is not measured for it.
 func (s *Server) resolveCancelledTerminal(requestID, terminal, outcome string, now time.Time) (zombieEntry, bool) {
 	e, ok := s.zombieCanceller.terminal(requestID)
 	if !ok {
 		return zombieEntry{}, false
 	}
-	s.ddHistogram(metricCancelToTerminalMs, cancelLatencyMs(now.Sub(e.firstCancelAt)),
-		[]string{"terminal:" + terminal, "model:" + modelTag(e.model), "cause:" + e.cause})
-	s.ddIncr(metricCancelledTerminal, []string{"outcome:" + outcome, "cause:" + e.cause})
+	delivered := e.sent > 0
+	if delivered {
+		s.ddHistogram(metricCancelToTerminalMs, cancelLatencyMs(now.Sub(e.firstCancelAt)),
+			[]string{"terminal:" + terminal, "model:" + modelTag(e.model), "cause:" + e.cause})
+	}
+	s.ddIncr(metricCancelledTerminal, []string{"outcome:" + outcome, "cause:" + e.cause,
+		"delivered:" + strconv.FormatBool(delivered)})
 	return e, true
 }
 

@@ -6,6 +6,19 @@ import (
 	"time"
 )
 
+// deliverStrayChunk mirrors noteStrayChunk's success path: a stray chunk that
+// decides to (re-)send is followed by markSent once the enqueue succeeded. The
+// tracker itself only arms the short retry hold on the decision.
+func deliverStrayChunk(z *zombieStreamCanceller, requestID string, at time.Time) strayChunkResult {
+	res := z.strayChunk(requestID, at)
+	if res.send {
+		if idx := z.markSent(requestID, at); idx != res.resendIndex {
+			panic(fmt.Sprintf("markSent index %d != decided index %d", idx, res.resendIndex))
+		}
+	}
+	return res
+}
+
 // TestZombieStreamCancellerEscalatingSchedule pins the re-send schedule for a
 // request an abandon path recorded: stray chunks re-send the cancel at +1 s,
 // +3 s, +10 s after the FIRST cancel, then every 30 s.
@@ -36,7 +49,7 @@ func TestZombieStreamCancellerEscalatingSchedule(t *testing.T) {
 		{70 * time.Second, true, 4}, // steady regime: index capped
 	}
 	for _, st := range steps {
-		res := z.strayChunk("req-1", t0.Add(st.at))
+		res := deliverStrayChunk(z, "req-1", t0.Add(st.at))
 		if res.send != st.send {
 			t.Fatalf("at +%v: send=%v, want %v", st.at, res.send, st.send)
 		}
@@ -58,13 +71,13 @@ func TestZombieStreamCancellerLateFirstStrayChunkDoesNotBurst(t *testing.T) {
 	z.record("req-late", "m", cancelCauseHedgeLoser, t0)
 	z.markSent("req-late", t0)
 
-	if res := z.strayChunk("req-late", t0.Add(5*time.Second)); !res.send || res.resendIndex != 1 {
+	if res := deliverStrayChunk(z, "req-late", t0.Add(5*time.Second)); !res.send || res.resendIndex != 1 {
 		t.Fatalf("late first stray chunk: send=%v idx=%d, want send idx 1", res.send, res.resendIndex)
 	}
-	if res := z.strayChunk("req-late", t0.Add(5100*time.Millisecond)); res.send {
+	if res := deliverStrayChunk(z, "req-late", t0.Add(5100*time.Millisecond)); res.send {
 		t.Fatal("+3 s point already passed must be skipped, not fired as a burst")
 	}
-	if res := z.strayChunk("req-late", t0.Add(10*time.Second)); !res.send || res.resendIndex != 2 {
+	if res := deliverStrayChunk(z, "req-late", t0.Add(10*time.Second)); !res.send || res.resendIndex != 2 {
 		t.Fatalf("+10 s: send=%v idx=%d, want send idx 2", res.send, res.resendIndex)
 	}
 }
@@ -75,14 +88,14 @@ func TestZombieStreamCancellerLateFirstStrayChunkDoesNotBurst(t *testing.T) {
 func TestZombieStreamCancellerUnrecordedIdCancelsImmediately(t *testing.T) {
 	z := newZombieStreamCanceller()
 	t0 := time.Now()
-	res := z.strayChunk("bogus", t0)
+	res := deliverStrayChunk(z, "bogus", t0)
 	if !res.send || res.resendIndex != 0 || res.cause != cancelCauseStrayChunk {
 		t.Fatalf("first stray chunk for unknown id: %+v", res)
 	}
-	if res := z.strayChunk("bogus", t0.Add(500*time.Millisecond)); res.send {
+	if res := deliverStrayChunk(z, "bogus", t0.Add(500*time.Millisecond)); res.send {
 		t.Fatal("second chunk within 1 s must not re-cancel")
 	}
-	if res := z.strayChunk("bogus", t0.Add(time.Second)); !res.send || res.resendIndex != 1 {
+	if res := deliverStrayChunk(z, "bogus", t0.Add(time.Second)); !res.send || res.resendIndex != 1 {
 		t.Fatalf("+1 s: %+v, want re-send index 1", res)
 	}
 }
@@ -103,6 +116,57 @@ func TestZombieStreamCancellerSendFailureRetriesQuickly(t *testing.T) {
 	}
 }
 
+// TestZombieStreamCancellerUndeliveredCancelKeepsIndexZero: an abandon path
+// whose enqueue failed never marks the entry sent. The decision to re-send on
+// a stray chunk holds the entry for zombieResendRetry (a chunk burst yields
+// one attempt) without advancing the schedule or the resend index; the first
+// delivery — whenever it happens — is index 0 and only then does the
+// escalating schedule start.
+func TestZombieStreamCancellerUndeliveredCancelKeepsIndexZero(t *testing.T) {
+	z := newZombieStreamCanceller()
+	t0 := time.Now()
+	z.record("req-u", "m", cancelCauseClientGonePost, t0)
+	z.noteSendFailed("req-u", t0) // abandon path's own send was refused
+
+	if res := z.strayChunk("req-u", t0.Add(zombieResendRetry/2)); res.send {
+		t.Fatal("retry must wait zombieResendRetry")
+	}
+	res := z.strayChunk("req-u", t0.Add(zombieResendRetry))
+	if !res.send || res.resendIndex != 0 || res.cause != cancelCauseClientGonePost {
+		t.Fatalf("first retry decision: %+v, want send idx 0 under the abandon cause", res)
+	}
+	// The decision alone holds the entry (one attempt per burst) ...
+	if res := z.strayChunk("req-u", t0.Add(zombieResendRetry+time.Millisecond)); res.send {
+		t.Fatal("a chunk inside the hold must not decide a second send")
+	}
+	// ... and a failed retry leaves it undelivered: still index 0 next time.
+	z.noteSendFailed("req-u", t0.Add(zombieResendRetry))
+	res = z.strayChunk("req-u", t0.Add(2*zombieResendRetry))
+	if !res.send || res.resendIndex != 0 {
+		t.Fatalf("second retry decision: %+v, want send idx 0 (nothing delivered yet)", res)
+	}
+	e := z.entries["req-u"]
+	if e.sent != 0 {
+		t.Fatalf("sent = %d before any successful enqueue, want 0", e.sent)
+	}
+	// Delivered: index 0, schedule anchored on the FIRST cancel time.
+	if idx := z.markSent("req-u", t0.Add(2*zombieResendRetry)); idx != 0 {
+		t.Fatalf("markSent index = %d, want 0 for the first delivered cancel", idx)
+	}
+	if e.sent != 1 {
+		t.Fatalf("sent = %d after the delivered retry, want 1", e.sent)
+	}
+	if res := deliverStrayChunk(z, "req-u", t0.Add(900*time.Millisecond)); res.send {
+		t.Fatal("+0.9 s: the +1 s schedule point has not arrived")
+	}
+	if res := deliverStrayChunk(z, "req-u", t0.Add(time.Second)); !res.send || res.resendIndex != 1 {
+		t.Fatalf("+1 s: %+v, want re-send index 1", res)
+	}
+	if idx := z.markSent("never-recorded", t0); idx != -1 {
+		t.Fatalf("markSent on an untracked id = %d, want -1", idx)
+	}
+}
+
 // TestZombieStreamCancellerTerminalResolvesEntry: the provider terminal
 // returns the entry (first cancel time, cause, model) exactly once.
 func TestZombieStreamCancellerTerminalResolvesEntry(t *testing.T) {
@@ -110,7 +174,7 @@ func TestZombieStreamCancellerTerminalResolvesEntry(t *testing.T) {
 	t0 := time.Now()
 	z.record("req-t", "model-x", cancelCauseClientGonePre, t0)
 	z.markSent("req-t", t0)
-	z.strayChunk("req-t", t0.Add(200*time.Millisecond))
+	deliverStrayChunk(z, "req-t", t0.Add(200*time.Millisecond))
 
 	e, ok := z.terminal("req-t")
 	if !ok {
@@ -162,7 +226,7 @@ func TestZombieStreamCancellerSweepExpiresIdleEntries(t *testing.T) {
 	t0 := time.Now()
 	z.record("req-a", "m", cancelCauseClientGonePost, t0)
 	z.markSent("req-a", t0)
-	z.strayChunk("req-a", t0.Add(2*time.Second))
+	deliverStrayChunk(z, "req-a", t0.Add(2*time.Second))
 	z.record("req-b", "m", cancelCauseHedgeLoser, t0) // never any chunk
 
 	// Still live just under the TTL (activity = last stray chunk at +2 s).

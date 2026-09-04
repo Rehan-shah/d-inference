@@ -8,8 +8,9 @@ import (
 // Zombie-stream cancel tracking.
 //
 // Every abandon path that may leave a provider generating records its request
-// here when it sends the cancel (sendAbandonCancel / cancelDispatch). The entry
-// lets the coordinator:
+// here before it sends the cancel (sendAbandonCancel / cancelDispatch) and
+// marks the entry sent only once the frame was handed to the provider writer.
+// The entry lets the coordinator:
 //
 //   - correlate the provider's eventual terminal with the cancel and emit
 //     inference.cancel_to_terminal_ms instead of dropping it as "unknown";
@@ -69,7 +70,10 @@ type zombieEntry struct {
 	lastStrayAt  time.Time
 	nextResendAt time.Time
 	scheduleIdx  int
-	// sent counts cancels sent so far: the abandon path's first plus re-sends.
+	// sent counts cancels actually handed to the provider writer so far: the
+	// abandon path's first plus re-sends. It stays 0 while every enqueue has
+	// failed (control lane full, writer stopped), so a terminal that arrives
+	// then is the provider finishing on its own, not honoring a cancel.
 	sent        int
 	strayChunks int
 }
@@ -132,7 +136,8 @@ func newZombieStreamCanceller() *zombieStreamCanceller {
 
 // strayChunkResult is what strayChunk decided for one chunk.
 type strayChunkResult struct {
-	// send reports whether a cancel should be (re-)sent now.
+	// send reports whether a cancel should be (re-)sent now; resendIndex is
+	// the index that send would carry (0 = no cancel delivered yet).
 	send        bool
 	resendIndex int
 	// cause is the entry's cancel cause; cancelCauseStrayChunk means no abandon
@@ -172,16 +177,21 @@ func (z *zombieStreamCanceller) record(requestID, model, cause string, now time.
 	return true, expired
 }
 
-// markSent notes that a cancel was just sent for a recorded requestID.
-func (z *zombieStreamCanceller) markSent(requestID string, now time.Time) {
+// markSent notes that a cancel was just handed to the provider writer for a
+// recorded requestID and returns its resend index (0 for the first cancel
+// delivered for the id, whichever path delivered it; -1 for an untracked id).
+// Callers invoke it only after the enqueue succeeded.
+func (z *zombieStreamCanceller) markSent(requestID string, now time.Time) (resendIndex int) {
 	if z == nil {
-		return
+		return -1
 	}
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	if e := z.entries[requestID]; e != nil {
-		e.markSent(now)
+	e := z.entries[requestID]
+	if e == nil {
+		return -1
 	}
+	return e.markSent(now)
 }
 
 // forget drops requestID: a terminal had already claimed the attempt, so no
@@ -210,7 +220,10 @@ func (z *zombieStreamCanceller) noteSendFailed(requestID string, now time.Time) 
 
 // strayChunk notes a chunk for a request the coordinator no longer tracks and
 // decides whether to (re-)send the cancel. An id nobody abandoned gets an
-// entry of its own (cause cancelCauseStrayChunk) and an immediate cancel.
+// entry of its own (cause cancelCauseStrayChunk) and an immediate cancel. A
+// send decision holds the entry for zombieResendRetry so a burst of chunks
+// yields one attempt; the caller marks the send (markSent) only after the
+// enqueue succeeded, or leaves the hold as the retry point when it failed.
 func (z *zombieStreamCanceller) strayChunk(requestID string, now time.Time) strayChunkResult {
 	if z == nil {
 		// Untracked (zero-value Server): still cancel, never throttle.
@@ -232,7 +245,8 @@ func (z *zombieStreamCanceller) strayChunk(requestID string, now time.Time) stra
 	res.model = e.model
 	if e.resendDue(now) {
 		res.send = true
-		res.resendIndex = e.markSent(now)
+		res.resendIndex = min(e.sent, zombieResendIndexMax)
+		e.nextResendAt = now.Add(zombieResendRetry)
 	}
 	return res
 }

@@ -81,7 +81,9 @@ func TestSendProviderCancelMetersDeliveryFailure(t *testing.T) {
 // on the speculative empty-completion decision WITHOUT RemovePending, so its
 // record is still live when cancelDispatch runs — yet the completion ingress
 // proves nothing is running. No cancel, no cancel_sent, no zombie entry. A
-// racer with no terminal at all still gets its cancel recorded and counted.
+// racer with no terminal at all still gets its cancel recorded; this fixture
+// has no socket, so nothing is handed to a writer and cancel_sent stays at
+// zero (delivery counting is pinned in TestCancelSendCountsOnlyDeliveredFrames).
 func TestCancelDispatchSkipsCancelAfterCompletionIngress(t *testing.T) {
 	collector := newUDPCollector(t)
 	defer collector.Close()
@@ -125,7 +127,108 @@ func TestCancelDispatchSkipsCancelAfterCompletionIngress(t *testing.T) {
 		t.Fatalf("a still-running racer must be tracked for terminal correlation (size=%d)", n)
 	}
 	_ = dd.Statsd.Flush()
-	requireMetricWithTags(t, collector.drain(), metricCancelSent, "cause:"+cancelCauseHedgeLoser, "model:"+model)
+	if got := findMetrics(collector.drain(), metricCancelSent); len(got) != 0 {
+		t.Fatalf("no socket, no frame handed over: cancel_sent must not fire, got %v", got)
+	}
+}
+
+// TestCancelSendCountsOnlyDeliveredFrames pins the delivery semantics of the
+// cancel lifecycle telemetry. A cancel whose enqueue fails (writer stopped /
+// control lane full) is recorded but neither marked nor counted on
+// inference.cancel_sent; a terminal for it is correlated (so the caller does
+// not log it as unknown) but reported as cancelled_terminal{delivered:false}
+// with no cancel_to_terminal_ms sample. The next stray chunk retries; the
+// first cancel that reaches a writer counts cancel_sent exactly once, under
+// the abandon path's cause, and a terminal after it is delivered:true with a
+// latency sample. A live provider whose first send succeeds is counted at once.
+func TestCancelSendCountsOnlyDeliveredFrames(t *testing.T) {
+	srv, reg, _, ts := setupTestServer(t)
+	defer ts.Close()
+	collector := newUDPCollector(t)
+	defer collector.Close()
+	dd := newTestDD(t, collector)
+	defer dd.Close()
+	srv.SetDatadog(dd)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const model = "cancel-delivery-model"
+	conn := connectProvider(t, ctx, ts.URL, []protocol.ModelInfo{{ID: model, ModelType: "chat"}}, "fX6XYH7p2hmM3ogeXaAsY+p8M6UKD1df/LJUN9Nj9Nw=")
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	ids := reg.ProviderIDs()
+	if len(ids) != 1 {
+		t.Fatalf("registered providers = %v, want exactly one", ids)
+	}
+	live := reg.GetProvider(ids[0])
+	dead := &registry.Provider{ID: "p-dead", Conn: &websocket.Conn{}}
+	entry := func(id string) zombieEntry {
+		srv.zombieCanceller.mu.Lock()
+		defer srv.zombieCanceller.mu.Unlock()
+		e := srv.zombieCanceller.entries[id]
+		if e == nil {
+			t.Fatalf("no zombie entry for %s", id)
+		}
+		return *e
+	}
+	drain := func() []string {
+		_ = dd.Statsd.Flush()
+		return collector.drain()
+	}
+
+	// Enqueue fails: recorded, unsent, not counted.
+	t0 := time.Now()
+	srv.sendAbandonCancel(dead, "req-fail", model, cancelCauseClientGonePost)
+	packets := drain()
+	if got := findMetrics(packets, metricCancelSent); len(got) != 0 {
+		t.Fatalf("a failed enqueue must not count as sent: %v", got)
+	}
+	requireMetricWithTags(t, packets, metricCancelSendFailed, "reason:writer_stopped")
+	if e := entry("req-fail"); e.sent != 0 || e.cause != cancelCauseClientGonePost {
+		t.Fatalf("entry after failed send = %+v, want sent=0 with the abandon cause", e)
+	}
+
+	// The provider finishes on its own: correlated, but no cancel was delivered.
+	e, ok := srv.resolveCancelledTerminal("req-fail", cancelTerminalComplete, cancelledOutcomeCompletePartial, t0.Add(time.Second))
+	if !ok || e.sent != 0 {
+		t.Fatalf("terminal correlation = (%+v, %v), want the unsent entry", e, ok)
+	}
+	packets = drain()
+	if got := findMetrics(packets, metricCancelToTerminalMs); len(got) != 0 {
+		t.Fatalf("no cancel reached the provider, so no cancel→terminal latency: %v", got)
+	}
+	requireMetricWithTags(t, packets, metricCancelledTerminal,
+		"outcome:"+cancelledOutcomeCompletePartial, "cause:"+cancelCauseClientGonePost, "delivered:false")
+
+	// Enqueue fails, then a stray chunk retries on a writer that accepts: the
+	// first DELIVERED cancel counts cancel_sent once under the abandon cause.
+	srv.sendAbandonCancel(dead, "req-retry", model, cancelCauseFirstChunkTimeout)
+	packets = drain()
+	if got := findMetrics(packets, metricCancelSent); len(got) != 0 {
+		t.Fatalf("a failed enqueue must not count as sent: %v", got)
+	}
+	srv.noteStrayChunk(live, live.ID, "req-retry", time.Now().Add(zombieResendRetry))
+	packets = drain()
+	requireMetricWithTags(t, packets, metricCancelSent, "cause:"+cancelCauseFirstChunkTimeout, "model:"+model)
+	requireMetricWithTags(t, packets, metricZombieStreamCancel, "resend_index:0")
+	if e := entry("req-retry"); e.sent != 1 {
+		t.Fatalf("entry after the delivered retry = %+v, want sent=1", e)
+	}
+	if _, ok := srv.resolveCancelledTerminal("req-retry", cancelTerminalError, cancelledOutcomeErrorCancelled, time.Now()); !ok {
+		t.Fatal("delivered retry must still correlate its terminal")
+	}
+	packets = drain()
+	requireMetricWithTags(t, packets, metricCancelToTerminalMs, "terminal:"+cancelTerminalError, "cause:"+cancelCauseFirstChunkTimeout)
+	requireMetricWithTags(t, packets, metricCancelledTerminal,
+		"outcome:"+cancelledOutcomeErrorCancelled, "cause:"+cancelCauseFirstChunkTimeout, "delivered:true")
+
+	// A live writer: counted on the first send, exactly once.
+	srv.sendAbandonCancel(live, "req-live", model, cancelCauseHedgeLoser)
+	packets = drain()
+	if got := requireMetricWithTags(t, packets, metricCancelSent, "cause:"+cancelCauseHedgeLoser, "model:"+model); len(got) != 1 {
+		t.Fatalf("cancel_sent for a delivered first send = %v, want exactly one", got)
+	}
+	if e := entry("req-live"); e.sent != 1 {
+		t.Fatalf("entry after a delivered first send = %+v, want sent=1", e)
+	}
 }
 
 // TestUnknownTerminalPathsOnBareServer: the unknown-request branches of the

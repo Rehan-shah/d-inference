@@ -887,7 +887,7 @@ func TestIntegration_ZombieStreamRecancelScheduleAndCompleteTerminal(t *testing.
 	requireMetricWithTags(t, packets, metricCancelSent, "cause:"+cancelCauseClientGonePost, "model:"+model)
 	requireMetricWithTags(t, packets, metricZombieStreamCancel, "resend_index:1")
 	requireMetricWithTags(t, packets, metricZombieStreamCancel, "resend_index:2")
-	requireMetricWithTags(t, packets, metricCancelledTerminal, "outcome:"+cancelledOutcomeCompletePartial)
+	requireMetricWithTags(t, packets, metricCancelledTerminal, "outcome:"+cancelledOutcomeCompletePartial, "delivered:true")
 	if got := findMetrics(packets, metricCancelUnresolved); len(got) != 0 {
 		t.Fatalf("a correlated terminal must not also count as unresolved: %v", got)
 	}
@@ -909,7 +909,7 @@ func TestIntegration_CancelToTerminalOnLateErrorTerminal(t *testing.T) {
 	if v := metricValue(t, hist[0]); v < 0.8*float64(zombieFor/time.Millisecond) {
 		t.Fatalf("cancel_to_terminal_ms = %v, want >= ~%v", v, zombieFor)
 	}
-	requireMetricWithTags(t, packets, metricCancelledTerminal, "outcome:"+cancelledOutcomeErrorCancelled)
+	requireMetricWithTags(t, packets, metricCancelledTerminal, "outcome:"+cancelledOutcomeErrorCancelled, "delivered:true")
 	requireMetricWithTags(t, packets, metricZombieStreamCancel, "resend_index:1")
 	requireNoIdentityInPackets(t, packets, requestID)
 }
