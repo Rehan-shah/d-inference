@@ -4,7 +4,15 @@ Stacks on `perf/coordinator-registry-scan-2026-09-03` (PR B: per-model index, ar
 cached medians). **Merge after it and after PR #818** (`perf/coordinator-tier1-2026-09-03`, the
 `lockWrite(site)` observer and `ScanCount` stamp); this branch is rebased onto #818 once it lands —
 the six recorder bodies #818 instruments are rewritten wholesale here, so the conflicts resolve
-to this branch.
+to this branch. Two things to do **at that rebase**:
+
+- #818's `TestRegistryLockWaitHistogramTaggedBySite` (api) drives a `registry.mu.write_wait_ms`
+  sample through `reg.ClearDispatchLoadCooldown` behind `HoldWriteLockForTest`. On this branch that
+  recorder never touches `r.mu`, so the test must be retargeted at a remaining `r.mu` writer (a
+  config setter, or the commit in `global` mode) or it hangs.
+- Route `commitLock.lock()` in `global` mode through `r.lockWrite("commit")` /
+  `("commit_plan")` so the kill switch keeps its write-wait histogram; in `shared` mode the commit
+  takes `r.mu.RLock` and has no write wait to report.
 
 Design and evidence: `docs/reports/2026-09-03-coordinator-perf-proposal/01-registry-lock.md`
 (E1–E4), README §3 Tier 3 and §6.
@@ -151,12 +159,17 @@ The request-path suites run in both modes (`forEachCommitMode`).
 | **parallel speed-up (serial ÷ parallel)** | **≈1.2×** | **≈2.3×** (read-only walk ceiling on this box at that moment: 2.6×) |
 | FleetReserveProviderExParallel-16 | 311–351 µs/op | 312 µs/op (fixture herds every goroutine onto model 0 with colliding request ids → rescans dominate; not a lock signal) |
 
-`TestRequestPathParallelSpeedup` pins the guard: ≥ 4× at 16 threads when the box's own read-only
-walk reaches 4× (an unloaded machine), otherwise the request path must parallelize at least 60% as
-well as the read-only walk (the base branch is at ≈45%). Each quantity is the best of three
-interleaved fixed-work runs; it logs both speed-ups and the load average, and skips (numbers logged)
-when the 1-minute load exceeds 2×GOMAXPROCS, where lock-holder preemption defeats every scheme. On
-this box at load 449 it measured read-only 4.75× vs request path 3.50× (74%).
+`TestRequestPathParallelSpeedup` pins the guard. **Deviation from the proposal's "asserts ≥ 4× at
+16 threads":** the absolute 4× is asserted only when the box's own read-only fleet walk (RLock, no
+writers) reaches 4× — an unloaded machine; on a busy box it asserts the relative property instead
+(request path ≥ 60% of the read-only walk's speed-up; the base branch sits at ≈45%), and above a
+1-minute load of 2×GOMAXPROCS it skips with the numbers logged, because lock-holder preemption
+defeats every locking scheme there. Each quantity is the best of three interleaved fixed-work runs.
+On the development box (load 449–459 on 16 cores) it therefore **skipped**, measuring read-only
+4.75× vs request path 3.50× (74%). The request path's ceiling sits below the read-only walk's
+because of three pre-existing global write locks the read walk does not pay: `ttftCalibration.
+notePrediction` per warm commit, the warm-pool `recordEvent` per cold dispatch, and the cache
+tracker on `RemovePending`. None of them is `r.mu`.
 
 ## Acceptance metrics (prod, via #809 stamps)
 
@@ -175,6 +188,21 @@ this box at load 449 it measured read-only 4.75× vs request path 3.50× (74%).
    `EIGENINFERENCE_ROUTING_CONCURRENCY` to the container's CPU quota so it bounds scan CPU as
    designed.
 3. Re-profile 30 s after landing and diff against 00.
+
+## Behaviour-neutral changes worth knowing about
+
+- `ClearDispatchLoadCooldown` returns without taking any lock when the identity has no dispatch-load
+  state (one flag load) — the common completion case.
+- `RecordCapacityAcceptOutcome(_, _, false)` lost its read-only no-state probe; every accept now takes
+  one uncontended `gate.mu` (microseconds, per identity) instead of an `r.mu.RLock` probe.
+- `Disconnect` of an identity-less session drops **all** of that session's fault residue (capacity
+  trackers included); before, only breaker / inference-error / dispatch-load residue was dropped.
+- `TestReserveProviderWithPlanPrimarySelectionUnchanged` compared candidate summaries including
+  their wall-clock `HBAgeMs`; it flaked 4/40 under `-race` on the loaded box (0/40 on base at that
+  moment). The summaries' heartbeat ages are now zeroed like the decision's own `SnapshotAgeMs`.
+  Test-only; revert if preferred.
+- No concurrent test drives `ReserveNextFromPlan` (the plan is single-consumer); it is covered by the
+  existing sequential plan suite under `-race`, in the default (shared) mode.
 
 ## Remaining `r.mu` writers
 
