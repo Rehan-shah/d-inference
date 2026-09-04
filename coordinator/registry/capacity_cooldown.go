@@ -393,22 +393,22 @@ func (r *Registry) RecordCapacityAcceptOutcome(providerID, modelID string, count
 	// An identity with no gate has nothing to clear; create one only when
 	// there is a rate outcome to record, so a straggling accept for a dead
 	// session does not file a gate under its id.
-	g := r.lookupGateForSession(providerID)
-	if g == nil {
+	ref := r.lookupSessionGateRef(providerID)
+	if ref.g == nil {
 		if !countRateOutcome || r.capacityRateCfg.PenaltyMs <= 0 {
 			return false
 		}
-		g = r.gateForSession(providerID)
+		ref = r.gateForSession(providerID)
 	}
 	var heartbeatAt time.Time
 	var rawRemaining int64
 	var budgetReported bool
-	if g.hasPairState(gateFlagBudgetClamp) {
+	if ref.g.hasPairState(gateFlagBudgetClamp) {
 		heartbeatAt, rawRemaining, budgetReported = providerBudgetSnapshot(r.sessionProvider(providerID), modelID)
 	}
-	hold := r.lockGate(g, "capacity_accept")
+	hold := r.lockGate(ref, "capacity_accept")
 	defer hold.unlock()
-	g = hold.g
+	g := hold.g
 	now := time.Now()
 	delete(g.capacityRejectStrikes, modelID)
 	delete(g.capacityCooldowns, modelID)

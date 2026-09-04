@@ -2447,13 +2447,13 @@ func (r *Registry) RecordDispatchLoadFailure(providerID, modelID string) bool {
 // (called when the pair serves a request successfully — it can load after all).
 // Runs at request completion; takes only the identity's gate.mu.
 func (r *Registry) ClearDispatchLoadCooldown(providerID, modelID string) {
-	g := r.lookupGateForSession(providerID)
-	if !g.hasPairState(gateFlagDispatchLoad) {
+	ref := r.lookupSessionGateRef(providerID)
+	if !ref.g.hasPairState(gateFlagDispatchLoad) {
 		return // nothing to clear — the common case, one lock-free flag load
 	}
-	hold := r.lockGate(g, "dispatch_load_clear")
+	hold := r.lockGate(ref, "dispatch_load_clear")
 	defer hold.unlock()
-	g = hold.g
+	g := hold.g
 	delete(g.dispatchLoadCooldowns, modelID)
 	g.updatedLocked(time.Now())
 }

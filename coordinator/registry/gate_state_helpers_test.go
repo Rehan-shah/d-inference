@@ -19,19 +19,19 @@ func rawGateForKey(r *Registry, key string) *gateState {
 // test that backdates a gate's activity keeps its backdate); use the real
 // recorders to model activity.
 func withGateForKey(r *Registry, key string, fn func(g *gateState)) {
-	g := r.gateForKey(key).lockResolved()
-	fn(g)
-	g.publishLocked()
-	g.mu.Unlock()
+	hold := r.lockGate(r.gateForKey(key), "test")
+	fn(hold.g)
+	hold.g.publishLocked()
+	hold.unlock()
 }
 
 // withGateForSession is withGateForKey resolving a session id the way the
 // recorders do (bound identity → disconnect cache → session id).
 func withGateForSession(r *Registry, sessionID string, fn func(g *gateState)) {
-	g := r.gateForSession(sessionID).lockResolved()
-	fn(g)
-	g.publishLocked()
-	g.mu.Unlock()
+	hold := r.lockGate(r.gateForSession(sessionID), "test")
+	fn(hold.g)
+	hold.g.publishLocked()
+	hold.unlock()
 }
 
 // readGateForKey runs fn on the gate filed under key under its lock. fn

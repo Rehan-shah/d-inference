@@ -22,7 +22,8 @@ import (
 func TestStaleGatePointerFollowsIdentityMigration(t *testing.T) {
 	reg := New(testLogger())
 	p := makeSchedulerProvider(t, reg, "sess-stale", "m", 100)
-	stale := reg.gateForSession(p.ID)
+	ref := reg.gateForSession(p.ID)
+	stale := ref.g
 	if stale == nil || stale.key != p.ID {
 		t.Fatalf("pre-bind gate = %+v, want the session-keyed gate", stale)
 	}
@@ -38,7 +39,7 @@ func TestStaleGatePointerFollowsIdentityMigration(t *testing.T) {
 	if stale.resolve() != target {
 		t.Fatal("resolve() on the stale pointer must follow the migration forward")
 	}
-	hold := reg.lockGate(stale, "test")
+	hold := reg.lockGate(ref, "test")
 	if hold.g != target {
 		hold.unlock()
 		t.Fatal("lockGate on the stale pointer must lock the live gate")
@@ -324,4 +325,312 @@ func TestRecordersDoNotTakeTheRegistryWriteLock(t *testing.T) {
 		t.Fatal("a recorder blocked behind the registry write lock")
 	}
 	reg.mu.Unlock()
+}
+
+// A recorder that resolved a gate SHARED by two sessions just before one of
+// them rebinds (sekey: → serial: enrichment) must land its outcome on the
+// rebinding session's NEW gate — the shared gate stays in the index for the
+// other session, carries no forward, and was emptied by the migration, so
+// only the session's own repointed p.gate can tell the stale holder to move.
+// The other session's recorder, resolved at the same moment, stays put.
+func TestStaleRefFollowsSharedIdentityRebind(t *testing.T) {
+	reg := New(testLogger())
+	p1 := makeSchedulerProvider(t, reg, "sess-rebind-1", "m", 100)
+	p2 := makeSchedulerProvider(t, reg, "sess-rebind-2", "m", 100)
+	pk := &attestation.VerificationResult{Valid: true, PublicKey: "PK-REBIND"}
+	p1.SetAttestationResult(pk)
+	p2.SetAttestationResult(pk)
+	shared := reg.lookupGateForKey("sekey:PK-REBIND")
+	if shared == nil || p1.gate.Load() != shared || p2.gate.Load() != shared {
+		t.Fatal("both sessions must share the identity's gate")
+	}
+	reg.RecordProviderOutcome(p1.ID, false, 500, "internal error")
+
+	// Two recorders resolve the shared gate, one per session...
+	ref1 := reg.gateForSession(p1.ID)
+	ref2 := reg.gateForSession(p2.ID)
+	if ref1.g != shared || ref1.p != p1 || ref2.g != shared || ref2.p != p2 {
+		t.Fatalf("refs = %+v / %+v, want the shared gate via each session", ref1, ref2)
+	}
+	// ...and p1 enriches to a serial before either takes the lock.
+	p1.SetAttestationResult(&attestation.VerificationResult{Valid: true, PublicKey: "PK-REBIND", SerialNumber: "SER-REBIND"})
+	target := p1.gate.Load()
+	if target == shared || target.key != "serial:SER-REBIND" {
+		t.Fatalf("p1's gate after the rebind = %+v, want serial:SER-REBIND", target)
+	}
+	if shared.forwardTo.Load() != nil || rawGateForKey(reg, "sekey:PK-REBIND") != shared {
+		t.Fatal("precondition: the shared gate stays in the index, unforwarded, for p2")
+	}
+	if !gateHasBreakerWindow(reg, "serial:SER-REBIND") || gateHasBreakerWindow(reg, "sekey:PK-REBIND") {
+		t.Fatal("precondition: the fault history moved to the enriched identity")
+	}
+
+	hold := reg.lockGate(ref1, "test")
+	if hold.g != target {
+		hold.unlock()
+		t.Fatalf("p1's recorder locked %q, want the session's new gate serial:SER-REBIND", hold.g.key)
+	}
+	hold.g.breakerTrips++
+	hold.g.updatedLocked(time.Now())
+	hold.unlock()
+	if got := providerBreakerTripsOf(reg, p1.ID); got != 1 {
+		t.Fatalf("p1's outcome did not land on its identity: trips=%d", got)
+	}
+	readGateForKey(reg, "sekey:PK-REBIND", func(g *gateState) {
+		if g == nil || g.breakerTrips != 0 || g.outcomes != nil {
+			t.Fatalf("p2's identity must be untouched by p1's stale recorder: %+v", g)
+		}
+	})
+
+	hold = reg.lockGate(ref2, "test")
+	if hold.g != shared {
+		hold.unlock()
+		t.Fatalf("p2's recorder locked %q, want its own (shared) gate", hold.g.key)
+	}
+	hold.g.healthWindowLocked().record(false, time.Now())
+	hold.g.updatedLocked(time.Now())
+	hold.unlock()
+	if !gateHasBreakerWindow(reg, "sekey:PK-REBIND") || providerBreakerTripsOf(reg, p2.ID) != 0 {
+		t.Fatal("p2's outcome must land on p2's identity, and only there")
+	}
+}
+
+// A trailing-flush recorder that resolved a disconnected identity's gate just
+// before the sweep dropped it (idle, no live session, past the grace) must not
+// write into the retired gate — the fault would vanish before the identity's
+// next reconnect. lockGate sees retired, re-resolves, and the fault lands on
+// the gate a fresh lookup finds. Both resolution paths: by session id through
+// the disconnect cache (RecordProviderOutcome) and by stable id
+// (RecordProviderServeOutcome).
+func TestStaleRefSurvivesSweepOfDisconnectedGate(t *testing.T) {
+	const key = "serial:SER-SWEEP-RACE"
+	backdate := func(g *gateState) { g.touched = time.Now().Add(-gateIdleGrace - time.Minute) }
+	for _, tc := range []struct {
+		name    string
+		resolve func(reg *Registry, sessionID string) gateRef
+	}{
+		{"by session through the disconnect cache", func(reg *Registry, sessionID string) gateRef { return reg.gateForSession(sessionID) }},
+		{"by stable id", func(reg *Registry, _ string) gateRef { return reg.gateForKey(key) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := New(testLogger())
+			p := attestSchedulerProvider(t, reg, "sess-sweep-race", "m", "SER-SWEEP-RACE", 100)
+			reg.Disconnect(p.ID)
+			// Nothing was ever recorded on the identity, so its gate is idle;
+			// backdate its creation past the grace so a PRESENT-time sweep
+			// drops it (a future-time sweep would also expire the disconnect
+			// cache the trailing flush resolves through).
+			withGateForKey(reg, key, backdate)
+
+			ref := tc.resolve(reg, p.ID)
+			stale := ref.g
+			if stale == nil || stale.key != key || ref.p != nil {
+				t.Fatalf("pre-sweep ref = %+v, want the disconnected identity's gate with no live session", ref)
+			}
+			reg.sweepGates(time.Now())
+			if rawGateForKey(reg, key) != nil {
+				t.Fatal("precondition: the sweep must drop the idle disconnected gate")
+			}
+
+			hold := reg.lockGate(ref, "test")
+			if hold.g == stale {
+				hold.unlock()
+				t.Fatal("lockGate handed out the gate the sweep retired")
+			}
+			if hold.g.key != key || rawGateForKey(reg, key) != hold.g {
+				hold.unlock()
+				t.Fatalf("re-resolved to %q (in index: %v), want a fresh %s gate", hold.g.key, rawGateForKey(reg, key) == hold.g, key)
+			}
+			now := time.Now()
+			hold.g.healthWindowLocked().record(false, now)
+			hold.g.updatedLocked(now)
+			hold.unlock()
+
+			stale.mu.Lock()
+			retired := stale.retired
+			stale.mu.Unlock()
+			if !retired {
+				t.Fatal("the swept gate must be marked retired under its lock")
+			}
+			if !gateHasBreakerWindow(reg, key) {
+				t.Fatal("the trailing fault must be on the gate a fresh lookup finds")
+			}
+			// The rest of the flush lands on the same gate and trips the
+			// identity's breaker — the reconnecting-zombie signal survives.
+			for i := 1; i < providerBreakerConsecTrip; i++ {
+				reg.RecordProviderOutcome(p.ID, false, 502, "provider disconnected")
+			}
+			if !reg.ProviderBreakerOpen(p.ID) {
+				t.Fatal("the identity's breaker must be open through the disconnected session id")
+			}
+		})
+	}
+}
+
+// A CLEAR recorder (no-insert resolution) whose gate was swept in the window
+// has nothing left to clear: it keeps the retired gate — its write is a no-op
+// — rather than file a gate under an identity nothing references.
+func TestClearRefNeverFilesAGateForASweptIdentity(t *testing.T) {
+	const key = "serial:SER-CLEAR-RACE"
+	reg := New(testLogger())
+	p := attestSchedulerProvider(t, reg, "sess-clear-race", "m", "SER-CLEAR-RACE", 100)
+	reg.Disconnect(p.ID)
+	withGateForKey(reg, key, func(g *gateState) { g.touched = time.Now().Add(-gateIdleGrace - time.Minute) })
+
+	ref := reg.lookupSessionGateRef(p.ID)
+	stale := ref.g
+	if stale == nil || stale.key != key || ref.insert {
+		t.Fatalf("pre-sweep lookup ref = %+v, want a no-insert ref to the identity's gate", ref)
+	}
+	reg.sweepGates(time.Now())
+	if rawGateForKey(reg, key) != nil {
+		t.Fatal("precondition: the sweep must drop the idle disconnected gate")
+	}
+	hold := reg.lockGate(ref, "test")
+	if hold.g != stale {
+		hold.unlock()
+		t.Fatalf("a clear re-resolved to %q; it must keep the retired gate", hold.g.key)
+	}
+	hold.unlock()
+	if rawGateForKey(reg, key) != nil || rawGateForKey(reg, p.ID) != nil {
+		t.Fatal("a clear must not file a gate for a swept identity or a dead session")
+	}
+	// Through the real recorder, on the dead session: still nothing filed.
+	reg.ClearDispatchLoadCooldown(p.ID, "m")
+	if reg.gateCount() != 0 {
+		t.Fatalf("gate index after a straggling clear = %d, want 0", reg.gateCount())
+	}
+}
+
+// A gate created for an identity with no live session (the trailing flush's
+// first fault, a serve outcome by stable id) counts its creation as activity:
+// it is not idle-droppable before the grace, so the recorder that created it
+// cannot lose the race against a sweep that runs before it takes the lock.
+func TestFreshGateIsNotSweptBeforeTheGrace(t *testing.T) {
+	reg := New(testLogger())
+	ref := reg.gateForSession("sess-ghost")
+	if ref.g == nil || ref.g.key != "sess-ghost" {
+		t.Fatalf("ref = %+v, want a fresh session-keyed gate", ref)
+	}
+	reg.sweepGates(time.Now())
+	if rawGateForKey(reg, "sess-ghost") != ref.g {
+		t.Fatal("a just-created gate must survive the sweep until the grace")
+	}
+	reg.sweepGates(time.Now().Add(gateIdleGrace + time.Minute))
+	if rawGateForKey(reg, "sess-ghost") != nil {
+		t.Fatal("an idle unreferenced gate must be swept once past the grace")
+	}
+}
+
+// Recorders racing identity rebinds (shared ↔ enriched) and sweeps that keep
+// retiring idle gates: interleaving coverage under -race for lockGate's
+// re-validation. The deterministic tests above carry the outcome assertions;
+// here the invariants are "no retired gate is ever in the index", "the other
+// session's binding is never disturbed", and a quiescent record lands on the
+// session's current gate.
+func TestGateRecordersRaceRebindsAndSweeps(t *testing.T) {
+	reg := New(testLogger())
+	const model = "m"
+	p1 := makeSchedulerProvider(t, reg, "sess-stress-1", model, 100)
+	p2 := makeSchedulerProvider(t, reg, "sess-stress-2", model, 100)
+	pk := &attestation.VerificationResult{Valid: true, PublicKey: "PK-STRESS"}
+	enriched := &attestation.VerificationResult{Valid: true, PublicKey: "PK-STRESS", SerialNumber: "SER-STRESS"}
+	p1.SetAttestationResult(pk)
+	p2.SetAttestationResult(pk)
+	// A disconnected identity that keeps faulting (never idle) and one that
+	// only ever sees successes (always idle: retired and re-created on every
+	// sweep once backdated).
+	gone := attestSchedulerProvider(t, reg, "sess-stress-gone", model, "SER-STRESS-GONE", 100)
+	quiet := attestSchedulerProvider(t, reg, "sess-stress-quiet", model, "SER-STRESS-QUIET", 100)
+	reg.Disconnect(gone.ID)
+	reg.Disconnect(quiet.ID)
+
+	backdateAll := func() {
+		reg.gatesMu.RLock()
+		gates := make([]*gateState, 0, len(reg.gates))
+		for _, g := range reg.gates {
+			gates = append(gates, g)
+		}
+		reg.gatesMu.RUnlock()
+		past := time.Now().Add(-gateIdleGrace - time.Minute)
+		for _, g := range gates {
+			g.mu.Lock()
+			g.touched = past
+			g.mu.Unlock()
+		}
+	}
+
+	const iters = 1500
+	var wg sync.WaitGroup
+	recorders := []func(i int){
+		func(i int) { reg.RecordProviderOutcome(p1.ID, i%3 != 0, 500, "internal error") },
+		func(i int) { reg.RecordCapacityReject(p1.ID, model) },
+		func(i int) { reg.RecordCapacityAccept(p1.ID, model) },
+		func(i int) { reg.RecordInferenceError(p1.ID, model, 500, "base") },
+		func(i int) { reg.RecordInferenceSuccess(p1.ID, model, "base") },
+		func(i int) { reg.ClearDispatchLoadCooldown(p1.ID, model) },
+		func(i int) { reg.RecordProviderServeOutcome("sekey:PK-STRESS", i%2 == 0, 500, "internal error") },
+		func(i int) { reg.RecordProviderOutcome(p2.ID, true, 200, "") },
+		func(i int) { reg.RecordProviderOutcome(gone.ID, false, 502, "provider disconnected") },
+		func(i int) { reg.RecordInferenceSuccess(quiet.ID, model, "base") },
+		func(i int) { reg.RecordProviderServeOutcome("serial:SER-STRESS-QUIET", true, 200, "") },
+	}
+	for _, rec := range recorders {
+		wg.Add(1)
+		go func(rec func(int)) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				rec(i)
+			}
+		}(rec)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if i%2 == 0 {
+				p1.SetAttestationResult(enriched)
+			} else {
+				p1.SetAttestationResult(pk)
+			}
+		}
+	}()
+	stop := make(chan struct{})
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			backdateAll()
+			reg.sweepGates(time.Now())
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	<-sweeperDone
+
+	reg.gatesMu.RLock()
+	for key, g := range reg.gates {
+		g.mu.Lock()
+		retired := g.retired
+		g.mu.Unlock()
+		if retired {
+			t.Errorf("retired gate %q is still in the index", key)
+		}
+	}
+	reg.gatesMu.RUnlock()
+	if g := p2.gate.Load(); g == nil || g.key != "sekey:PK-STRESS" || rawGateForKey(reg, "sekey:PK-STRESS") != g {
+		t.Fatalf("p2's binding was disturbed: %+v", g)
+	}
+	p1.SetAttestationResult(enriched)
+	reg.RecordProviderOutcome(p1.ID, false, 500, "internal error")
+	readGateForSession(reg, p1.ID, func(g *gateState) {
+		if g == nil || g.key != "serial:SER-STRESS" || g.outcomes == nil {
+			t.Fatalf("a quiescent fault must land on p1's current gate: %+v", g)
+		}
+	})
 }

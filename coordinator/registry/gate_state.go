@@ -38,6 +38,17 @@ import (
 // NO walk-wide gates lock on the scan: a lock taken for the whole fleet walk
 // with per-completion writers would rebuild the exact convoy this removes.
 //
+// A recorder resolves its gate under gatesMu.RLock and locks it AFTER letting
+// go of gatesMu, so the index can change in between: the identity bind can
+// move the session to another gate, the sweep can drop the gate. The
+// map-keyed implementation had no such window (key resolution and the write
+// shared one r.mu.Lock section), so lockGate re-establishes it: after
+// acquiring gate.mu it checks that the gate is still the one the outcome
+// belongs to (not retired, still the session's cached gate) and otherwise
+// releases, re-resolves through the index and retries. Everything that can
+// invalidate a resolved gate — the forward, the retire flag, the session's
+// repoint — is therefore written while holding that gate's mu.
+//
 // Sections under gate.mu must stay per identity and microseconds long.
 
 // Bits of gateState.pairFlags: which per-model trackers hold ANY entry for this
@@ -104,7 +115,15 @@ type gateState struct {
 	pairFlags          atomic.Uint32 // gateFlag* bits: which per-model maps are non-empty
 	newestRateRejectNS atomic.Int64  // newest capacity-503 rate reject across models; 0 = none
 
-	// touched is when a recorder last mutated this gate (sweep grace anchor).
+	// retired is set (under mu, before the index delete) when the sweep drops
+	// this idle gate from r.gates. A recorder that resolved the gate before
+	// the sweep and locks it afterwards must not write here — no lookup will
+	// ever find this gate again — so lockGate re-resolves instead.
+	retired bool
+
+	// touched is when a recorder last mutated this gate, or when it was
+	// created (sweep grace anchor: a fresh gate is not idle-droppable before
+	// the first recorder that resolved it has had a chance to lock it).
 	touched time.Time
 
 	// Node-health breaker (provider_breaker.go).
@@ -424,6 +443,100 @@ func (g *gateState) pruneLocked(r *Registry, now time.Time) (idle bool) {
 	return idle
 }
 
+// gateRef is a recorder's resolution of a gate: the gate plus how it was
+// reached, so that lockGate can prove — under gate.mu — that the gate is
+// still the one the outcome belongs to, and re-resolve when it is not. A
+// value type: the recorder path allocates nothing.
+type gateRef struct {
+	g *gateState
+	// p is the live session whose cached p.gate produced g; nil when g was
+	// reached through the disconnect cache, the bare session id or an
+	// explicit fault key (nothing can rebind those). After the lock,
+	// p.gate.Load() != g means the session rebound to another gate in
+	// between and the outcome belongs there.
+	p *Provider
+	// Exactly one of session / key names what to re-resolve.
+	session string
+	key     string
+	// insert says whether re-resolution may create the gate (gateForSession /
+	// gateForKey) or must find an existing one (lookupSessionGateRef: the
+	// "clear" recorders, which have nothing to clear on an identity without a
+	// gate and must not file one under a dead session id).
+	insert bool
+}
+
+// currentLocked reports whether g — locked by the caller — is still the gate
+// ref's outcome belongs to: not retired by the sweep, and, when the ref was
+// reached through a live session's cached pointer, still that session's gate.
+func (ref gateRef) currentLocked(g *gateState) bool {
+	if g.retired {
+		return false
+	}
+	return ref.p == nil || ref.p.gate.Load() == g
+}
+
+// gateRelockMaxRetries bounds how many times lockGate re-resolves a gate that
+// went stale between the index lookup and the lock. One retry is the
+// expected maximum (a rebind or a sweep landed in the window); the bound only
+// guarantees termination under an adversarial schedule, where the recorder
+// falls back to the gate it holds — today's behaviour, no worse.
+const gateRelockMaxRetries = 4
+
+// lockGate acquires gate.mu for a recorder at the named site. It follows any
+// migration forward (see lockResolved) and then validates, under the lock,
+// that the gate is still current for the ref (currentLocked); a stale gate is
+// released and the ref re-resolved through the index — gatesMu is never
+// taken while a gate.mu is held, so the lock order stands — and locked again.
+// The uncontended path is one TryLock — no clock reads; only a contended
+// acquisition is timed, and only a wait above gateWaitReportThreshold is
+// reported. The caller uses hold.g (the gate actually locked) and calls
+// hold.unlock.
+func (r *Registry) lockGate(ref gateRef, site string) gateHold {
+	var wait time.Duration
+	g := ref.g
+	retries := 0
+	for {
+		if !g.mu.TryLock() {
+			start := time.Now()
+			g.mu.Lock()
+			wait += time.Since(start)
+		}
+		if next := g.forwardTo.Load(); next != nil {
+			g.mu.Unlock()
+			g = next
+			continue
+		}
+		if retries >= gateRelockMaxRetries || ref.currentLocked(g) {
+			return gateHold{g: g, r: r, site: site, wait: wait}
+		}
+		// Stale: the sweep retired g, or the session rebound to another gate
+		// while we were between the index and the lock. Release, re-resolve
+		// through the index and try again.
+		g.mu.Unlock()
+		retries++
+		fresh := r.reresolveGate(ref)
+		if fresh.g == nil {
+			// A no-insert ref (a clear) whose identity has no gate any more:
+			// nothing left to clear. Keep the retired gate — its state is out
+			// of the index, so the write is a no-op — rather than file a gate
+			// under an identity nothing references.
+			fresh.g = g
+			retries = gateRelockMaxRetries
+		}
+		ref = fresh
+		g = fresh.g
+	}
+}
+
+// reresolveGate resolves ref again through the index (takes gatesMu; the
+// caller holds no gate.mu).
+func (r *Registry) reresolveGate(ref gateRef) gateRef {
+	if ref.key != "" {
+		return r.gateForKey(ref.key)
+	}
+	return r.sessionGateRef(ref.session, ref.insert)
+}
+
 // gateHold is an acquired gate.mu. unlock releases the gate and only then
 // reports a long acquisition wait to the observer, so the DogStatsD emit never
 // runs inside the critical section.
@@ -432,28 +545,6 @@ type gateHold struct {
 	r    *Registry
 	site string
 	wait time.Duration
-}
-
-// lockGate acquires g.mu for a recorder at the named site, following any
-// migration (see lockResolved). The uncontended path is one TryLock — no
-// clock reads; only a contended acquisition is timed, and only a wait above
-// gateWaitReportThreshold is reported. The caller uses hold.g (the resolved
-// gate) and calls hold.unlock.
-func (r *Registry) lockGate(g *gateState, site string) gateHold {
-	var wait time.Duration
-	for {
-		if !g.mu.TryLock() {
-			start := time.Now()
-			g.mu.Lock()
-			wait += time.Since(start)
-		}
-		next := g.forwardTo.Load()
-		if next == nil {
-			return gateHold{g: g, r: r, site: site, wait: wait}
-		}
-		g.mu.Unlock()
-		g = next
-	}
 }
 
 func (h gateHold) unlock() {
@@ -483,8 +574,8 @@ func (r *Registry) SetGateWaitObserver(fn func(site string, wait time.Duration))
 // lets a test prove a recorder blocks on the identity's gate, not on r.mu, and
 // that a long wait reaches the observer. Production code never calls it.
 func (r *Registry) HoldGateForTest(providerID string) (release func()) {
-	g := r.gateForSession(providerID).lockResolved()
-	return g.mu.Unlock
+	hold := r.lockGate(r.gateForSession(providerID), "test")
+	return hold.g.mu.Unlock
 }
 
 // --- Registry side: the gate index ---
@@ -516,6 +607,7 @@ func (r *Registry) ensureGateLocked(key string, now time.Time) *gateState {
 		r.sweepGatesLocked(now)
 	}
 	g := newGateState(key)
+	g.touched = now // creation counts as activity: see gateState.touched
 	r.gates[key] = g
 	return g
 }
@@ -523,17 +615,16 @@ func (r *Registry) ensureGateLocked(key string, now time.Time) *gateState {
 // gateForKey returns the gate filed under an explicit fault key / stable
 // identity (RecordProviderServeOutcome is keyed by the caller's stable id),
 // creating it on first use. One gatesMu.RLock in the common case.
-func (r *Registry) gateForKey(key string) *gateState {
+func (r *Registry) gateForKey(key string) gateRef {
 	r.gatesMu.RLock()
 	g := r.gates[key]
 	r.gatesMu.RUnlock()
-	if g != nil {
-		return g.resolve()
+	if g == nil {
+		r.gatesMu.Lock()
+		g = r.ensureGateLocked(key, time.Now())
+		r.gatesMu.Unlock()
 	}
-	r.gatesMu.Lock()
-	g = r.ensureGateLocked(key, time.Now())
-	r.gatesMu.Unlock()
-	return g
+	return gateRef{g: g.resolve(), key: key, insert: true}
 }
 
 // lookupGateForKey is gateForKey without the insert: nil when the identity has
@@ -550,42 +641,53 @@ func (r *Registry) lookupGateForKey(key string) *gateState {
 // old faultKeyLocked: the bound identity of a live session → the identity
 // cached at Disconnect for the trailing ErrorCh flush → the session id itself.
 // Recorders call this; it never touches r.mu.
-func (r *Registry) gateForSession(sessionID string) *gateState {
-	r.gatesMu.RLock()
-	g, key := r.resolveSessionGateLocked(sessionID)
-	r.gatesMu.RUnlock()
-	if g != nil {
-		return g.resolve()
-	}
-	r.gatesMu.Lock()
-	g = r.ensureGateLocked(key, time.Now())
-	r.gatesMu.Unlock()
-	return g
+func (r *Registry) gateForSession(sessionID string) gateRef {
+	return r.sessionGateRef(sessionID, true)
 }
 
-// lookupGateForSession is gateForSession without the insert: nil when the
-// session's identity has no state. Readers (the scan's fallback for a bare
-// provider, tests) call this.
+// lookupSessionGateRef is gateForSession without the insert: ref.g is nil when
+// the session's identity has no state. The recorders that only CLEAR state
+// (and so have nothing to do for an identity without a gate) resolve through
+// this, so a straggling clear for a dead session never files a gate under
+// its id — including when lockGate has to re-resolve.
+func (r *Registry) lookupSessionGateRef(sessionID string) gateRef {
+	return r.sessionGateRef(sessionID, false)
+}
+
+// lookupGateForSession is the plain-pointer form of lookupSessionGateRef for
+// readers (the scan's fallback for a bare provider, the *Active probes,
+// tests): nil when the session's identity has no state.
 func (r *Registry) lookupGateForSession(sessionID string) *gateState {
+	return r.sessionGateRef(sessionID, false).g
+}
+
+func (r *Registry) sessionGateRef(sessionID string, insert bool) gateRef {
 	r.gatesMu.RLock()
-	g, _ := r.resolveSessionGateLocked(sessionID)
+	g, key, via := r.resolveSessionGateLocked(sessionID)
 	r.gatesMu.RUnlock()
-	return g.resolve()
+	if g == nil && insert {
+		r.gatesMu.Lock()
+		g = r.ensureGateLocked(key, time.Now())
+		r.gatesMu.Unlock()
+	}
+	return gateRef{g: g.resolve(), p: via, session: sessionID, insert: insert}
 }
 
 // resolveSessionGateLocked returns the gate a session resolves to (nil when
-// its key has no gate yet) and that key. Caller holds gatesMu (either mode).
-func (r *Registry) resolveSessionGateLocked(sessionID string) (*gateState, string) {
+// its key has no gate yet), that key, and — when the gate came from a live
+// session's cached pointer — that session's Provider, so the caller can later
+// detect a rebind (gateRef.p). Caller holds gatesMu (either mode).
+func (r *Registry) resolveSessionGateLocked(sessionID string) (g *gateState, key string, via *Provider) {
 	if p := r.sessions[sessionID]; p != nil {
 		if g := p.gate.Load(); g != nil {
-			return g, g.key
+			return g, g.key, p
 		}
-		return r.gates[sessionID], sessionID
+		return r.gates[sessionID], sessionID, nil
 	}
 	if c, ok := r.disconnectedStableIDs[sessionID]; ok && c.id != "" && time.Since(c.at) < disconnectedStableIDTTL {
-		return r.gates[c.id], c.id
+		return r.gates[c.id], c.id, nil
 	}
-	return r.gates[sessionID], sessionID
+	return r.gates[sessionID], sessionID, nil
 }
 
 // faultKeyForSession resolves a session provider id to the key its fault state
@@ -595,7 +697,7 @@ func (r *Registry) resolveSessionGateLocked(sessionID string) (*gateState, strin
 func (r *Registry) faultKeyForSession(sessionID string) string {
 	r.gatesMu.RLock()
 	defer r.gatesMu.RUnlock()
-	_, key := r.resolveSessionGateLocked(sessionID)
+	_, key, _ := r.resolveSessionGateLocked(sessionID)
 	return key
 }
 
@@ -700,38 +802,47 @@ func (r *Registry) bindStableFaultKey(p *Provider, stableID string) {
 	}
 	target := r.ensureGateLocked(targetKey, now)
 	if cur != nil && stableID != "" {
-		// Migrate BEFORE repointing the session: a lock-free reader that loads
-		// p.gate must find either cur's intact pre-migration view or a target
-		// that already carries the merged state, never an empty target. (An
-		// unbind never migrates: session keying resumes and the identity keeps
-		// its state.) cur is orphaned when this was its last live session.
-		//
-		// A recorder that resolved a SHARED cur (another session still bound to
-		// it) just before this rebind lands its outcome on cur's now-empty
-		// state, not on the enriched identity — exactly what the map-keyed
-		// implementation did when the old key was re-created after the move.
-		r.migrateGateLocked(cur, target, cur.live <= 1)
+		// Migrate, and repoint the session INSIDE the migration's locked
+		// section: a lock-free reader that loads p.gate must find either cur's
+		// intact pre-migration view or a target that already carries the
+		// merged state, never an empty target; and a recorder that resolved
+		// cur before this rebind must, once it holds cur.mu, either have
+		// written before the merge (its outcome travels to target) or find
+		// p.gate moved and re-resolve (lockGate) — never write into the
+		// emptied cur. That matters most when cur is SHARED with another
+		// session (cur.live > 1): it stays in the index for that session and
+		// carries no forward, so the session's own pointer is the only thing
+		// that can tell a stale recorder its outcome now belongs to target.
+		// (An unbind never migrates: session keying resumes and the identity
+		// keeps its state.) cur is orphaned when this was its last live
+		// session.
+		r.migrateGateLocked(p, cur, target, cur.live <= 1)
+	} else {
+		p.gate.Store(target)
 	}
 	target.live++
-	p.gate.Store(target)
 	if cur != nil {
 		cur.live--
 	}
 }
 
 // migrateGateLocked re-keys accumulated fault state from src to dst (merge
-// policy in mergeLocked). src is emptied afterwards; when no live session
-// still points at it (orphan) it is forwarded to dst and dropped from the
-// index so stale pointers land on the live state. The only place two gate
+// policy in mergeLocked) and repoints p (the session being bound) at dst
+// while BOTH gates are locked, so no recorder can hold src.mu with p still
+// pointing at src after the merge. src is emptied afterwards; when no live
+// session still points at it (orphan) it is forwarded to dst and dropped from
+// the index so stale pointers land on the live state. The only place two gate
 // locks nest; caller holds gatesMu for writing, which serializes migrations.
-func (r *Registry) migrateGateLocked(src, dst *gateState, orphan bool) {
+func (r *Registry) migrateGateLocked(p *Provider, src, dst *gateState, orphan bool) {
 	if src == dst {
+		p.gate.Store(dst)
 		return
 	}
 	src.mu.Lock()
 	dst.mu.Lock()
 	dst.mergeLocked(src)
 	dst.publishLocked()
+	p.gate.Store(dst)
 	if orphan {
 		// Forward BEFORE resetting, and never republish the orphan: a
 		// lock-free reader that loaded src sees either its intact pre-merge
@@ -771,6 +882,13 @@ func (r *Registry) sweepGatesLocked(now time.Time) {
 		idle := g.pruneLocked(r, now)
 		g.publishLocked()
 		drop := idle && g.live <= 0 && now.Sub(g.touched) > gateIdleGrace
+		if drop {
+			// Retire under g.mu BEFORE the index delete: a recorder that
+			// resolved this gate before the walk and locks it afterwards
+			// sees retired and re-resolves (lockGate) instead of writing a
+			// trailing fault into a gate no lookup will ever find again.
+			g.retired = true
+		}
 		g.mu.Unlock()
 		if drop {
 			delete(r.gates, key)

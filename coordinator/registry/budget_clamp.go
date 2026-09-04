@@ -330,13 +330,13 @@ func (r *Registry) releaseBudgetClampsOnHeartbeat(providerID string, heartbeatAt
 	if !r.budgetClampCfg.Enabled || capacity == nil || len(capacity.Slots) == 0 {
 		return
 	}
-	g := r.lookupGateForSession(providerID)
-	if !g.hasPairState(gateFlagBudgetClamp) {
+	ref := r.lookupSessionGateRef(providerID)
+	if !ref.g.hasPairState(gateFlagBudgetClamp) {
 		return
 	}
-	hold := r.lockGate(g, "clamp_heartbeat")
+	hold := r.lockGate(ref, "clamp_heartbeat")
 	defer hold.unlock()
-	g = hold.g
+	g := hold.g
 	now := time.Now()
 	for _, slot := range capacity.Slots {
 		rawRemaining := slot.ActiveTokenBudgetMax - slot.ActiveTokenBudgetUsed - slot.QueuedTokenBudget

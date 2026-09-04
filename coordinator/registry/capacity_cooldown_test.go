@@ -30,7 +30,7 @@ func capacityCooldownExpiryOf(r *Registry, providerID, modelID string) (expiry t
 // commit would (check-and-claim under gate.mu); returns whether the claim
 // went through (false = the gate was closed to this request).
 func claimCapacityProbe(r *Registry, providerID, modelID string) bool {
-	return r.gateForSession(providerID).tryClaimCapacityProbe(modelID, time.Now())
+	return r.gateForSession(providerID).g.tryClaimCapacityProbe(modelID, time.Now())
 }
 
 // ageCapacityProbeClaim rewinds the pair's probe claim by d, simulating a
