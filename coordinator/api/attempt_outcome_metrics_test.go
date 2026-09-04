@@ -386,6 +386,43 @@ func TestDispatch_ClientGoneBetweenAttempts_RecordsClientGone(t *testing.T) {
 	}
 }
 
+// TestRecordRejection_MirrorsORView: the pre-dispatch rejection arm emits one
+// request_outcome_or_view increment per rejection, classed like
+// request_outcome and tagged with the RESOLVED model only (the requested name
+// is client-controlled and must never mint a tag value).
+func TestRecordRejection_MirrorsORView(t *testing.T) {
+	srv, _ := testServer(t)
+	collector := newUDPCollector(t)
+	defer collector.Close()
+	dd := newTestDD(t, collector)
+	defer dd.Close()
+	srv.SetDatadog(dd)
+
+	const model = "or-view-mirror-model"
+	srv.recordRejection(rejectionInfo{
+		stage: "preflight_capacity", reasonCode: "machine_busy", httpStatus: http.StatusTooManyRequests,
+		requestedModel: "client-typed-alias", resolvedModel: model, retryAfterMs: 7000,
+	})
+	srv.recordRejection(rejectionInfo{
+		stage: "validation", reasonCode: "bad_request", httpStatus: http.StatusBadRequest,
+		requestedModel: "client-typed-alias", resolvedModel: model,
+	})
+
+	_ = dd.Statsd.Flush()
+	packets := collector.drain()
+	if got := sumMetric(t, packets, metricRequestOutcomeORView, "model:"+model, "class:"+orClassRateLimited); got != 1 {
+		t.Errorf("request_outcome_or_view{rate_limited} = %v, want 1; packets=%v", got, findMetrics(packets, metricRequestOutcomeORView))
+	}
+	if got := sumMetric(t, packets, metricRequestOutcomeORView, "model:"+model, "class:"+orClassClientError); got != 1 {
+		t.Errorf("request_outcome_or_view{client_error} = %v, want 1; packets=%v", got, findMetrics(packets, metricRequestOutcomeORView))
+	}
+	for _, p := range findMetrics(packets, metricRequestOutcomeORView) {
+		if strings.Contains(p, "client-typed-alias") {
+			t.Errorf("request_outcome_or_view must tag the RESOLVED model only: %q", p)
+		}
+	}
+}
+
 // TestUnknownFrames_CountedByKindAndVersion: a provider sends chunk /
 // complete / error frames for a request the coordinator does not know. Each
 // must be counted on inference.unknown_frames by frame kind and the provider's

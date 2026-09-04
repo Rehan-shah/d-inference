@@ -95,7 +95,7 @@ flowchart LR
 ## Semantics deltas against #809 / PR A (intentional, documented here)
 
 1. `request_profiles.error_reason` and the `inference_routes` `error_class` for a request whose first-content clock expires while QUEUED are `queue_deadline`, not `first_chunk_timeout`. `TestQueuedAttemptExitsCarryRouteOutcome` (#809) is updated accordingly; `attempt_outcome` maps it to `capacity`.
-2. `StampCancelSent` is stamped only where a cancel frame is actually sent (`cancelDispatch` send branch, `cancelDispatchForFirstContentTimeout`, the post-commit defer's `sendRecordedCancel`, and the two write-error paths). `cancelDispatchAfterTerminal` never stamps — nothing was sent.
+2. `StampCancelSent` is stamped only where a cancel frame is actually sent (`cancelDispatch` send branch, `cancelDispatchForFirstContentTimeout`, the post-commit defer's `sendRecordedCancel`, and the two write-error paths). `cancelDispatchAfterTerminal` never stamps — nothing was sent. The stamp set is otherwise #809's: the two `handleChunk` abort cancels (late content, chunk overflow) send via `sendAbandonCancel` and are not stamped, exactly as on the base.
 3. A draining provider fails the routing gate on the capacity-cooldown branch, so #809's routing record tallies it under `GateCapacityCooldown`; no new `GateReason` is introduced.
 4. `inference.unknown_frames{kind,provider_version}` (new) counts frames whose id matched no recorded cancel; #809's `inference.unknown_request_frames{kind}` and the in-process `unknownRequestFrames` counter keep counting EVERY frame without a live pending record. The denominators differ by design; the owner can retire one.
 
@@ -121,6 +121,13 @@ flowchart LR
 ## Gates run
 
 Per commit: `gofmt -l .`, `go build ./...`, `go vet ./...`, `golangci-lint v2.1.6 run ./...` (0 issues), then `go test ./registry/... ./protocol/ ./api/` in the foreground. Final tree: all three packages green. One full-`./api/` run mid-port surfaced `TestConstrainedExactNonnegativeIntBoundsAdversarialLiterals` ("parse took 291 ms — superlinear parse regression") in an untouched file; it passes 3/3 in isolation (CPU-load flake, not on the known-flake list).
+
+## Follow-ups noted by the independent review (not in this PR)
+
+- `api/consumer.go` / `api/dispatch.go` write-error paths still cancel through the raw `sendProviderCancel`: the cancel is neither recorded in the zombie tracker nor counted in `inference.cancel_sent{cause}`, so a later terminal for that id classifies as stray/unknown. The source commit left them raw too; routing them through `sendAbandonCancel` with a `write_error` cause is a small follow-up.
+- `ClassifyPeerClose(peerCloseStatus, false)` hardcodes `oomSuspected=false` at its only call site (same as the source; outcome-neutral since OOM and read_error both take the abrupt cause).
+- The candidate-scan drop path now takes `p.mu` once per dropped provider to read the draining mark (previously only when a capacity cooldown was active) — one uncontended lock per dropped candidate.
+- `queue_deadline` is a new value in the rejection-ledger `reason_code`, `inference_routes.error_class` and `routing.first_chunk_timeout_reclassified{reason}` vocabularies; dashboards keyed on `first_chunk_timeout` shift accordingly.
 
 ## Notes for reviewers
 
