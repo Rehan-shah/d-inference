@@ -198,7 +198,7 @@ const disconnectedStableIDTTL = 2 * time.Minute
 
 // rememberDisconnectedStableIDLocked caches a provider's stable identity keyed by
 // its about-to-be-removed session id. Caller holds gatesMu for writing.
-func (r *Registry) rememberDisconnectedStableIDLocked(sessionID, stableID string) {
+func (r *Registry) rememberDisconnectedStableIDLocked(sessionID, stableID string, disconnectedAt time.Time) {
 	if r.disconnectedStableIDs == nil {
 		r.disconnectedStableIDs = make(map[string]disconnectedStableID)
 	}
@@ -210,7 +210,7 @@ func (r *Registry) rememberDisconnectedStableIDLocked(sessionID, stableID string
 			}
 		}
 	}
-	r.disconnectedStableIDs[sessionID] = disconnectedStableID{id: stableID, at: time.Now()}
+	r.disconnectedStableIDs[sessionID] = disconnectedStableID{id: stableID, at: disconnectedAt}
 }
 
 // RecordProviderServeOutcome feeds one terminal outcome into the stable-identity
@@ -238,6 +238,24 @@ func (r *Registry) RecordProviderServeOutcome(stableID string, ok bool, statusCo
 	hold := r.lockGate(r.gateForKey(stableID), "health_ejection")
 	defer hold.unlock()
 	g := hold.g
+	return r.recordProviderServeOutcomeOnGateLocked(g, ok, statusCode, errStr)
+}
+
+func (r *Registry) RecordProviderSessionServeOutcome(sessionID string, ok bool, statusCode int, errStr string) (ejected, recovered bool) {
+	if sessionID == "" || !healthEjectionEnabled() || r.faultKeyForSession(sessionID) == sessionID {
+		return false, false
+	}
+	source := r.captureDisconnectSource(sessionID)
+	hold := r.lockGate(r.gateForSession(sessionID), "health_ejection")
+	defer hold.unlock()
+	g := hold.g
+	if g == nil || g.key == sessionID || (!ok && statusCode == disconnectFlushStatusCode && source.supersededBy(g)) {
+		return false, false
+	}
+	return r.recordProviderServeOutcomeOnGateLocked(g, ok, statusCode, errStr)
+}
+
+func (r *Registry) recordProviderServeOutcomeOnGateLocked(g *gateState, ok bool, statusCode int, errStr string) (ejected, recovered bool) {
 	now := time.Now()
 	defer g.updatedLocked(now)
 
@@ -255,7 +273,7 @@ func (r *Registry) RecordProviderServeOutcome(stableID string, ok bool, statusCo
 
 	if providerOutcomeIsFault(statusCode, errStr) {
 		w := g.ejectionWindowLocked()
-		w.record(false, now)
+		w.recordFault(now, statusCode == disconnectFlushStatusCode)
 
 		if now.Before(g.ejectionUntil) {
 			return false, false // already ejected; in-flight faults don't re-arm until cooldown

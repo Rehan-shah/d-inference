@@ -1,6 +1,6 @@
 # Routing: how a request becomes a provider choice
 
-> Last updated: 2026-09-04 · commit `9d2138db3`
+> Last updated: 2026-09-04 · commit `16cbbf6da`
 
 Routing is the part of the coordinator that, given one inference request and
 the live fleet, picks the provider that should run it. It filters the fleet
@@ -486,15 +486,28 @@ kept as the kill switch behind
 keyed by fault key (serial → SE key → account → session id) with its own
 mutex; a connected provider caches its gate in `Provider.gate` (an atomic
 pointer). Recorders (`RecordProviderOutcome`, `RecordProviderServeOutcome`,
-`RecordInferenceError`, `RecordInferenceSuccess`, `RecordCapacityReject`,
+`RecordProviderSessionServeOutcome`, `RecordInferenceError`,
+`RecordInferenceSuccess`, `RecordCapacityReject`, `RecordCapacityAcceptObserved`,
 `RecordCapacityAcceptOutcome`, `RecordDispatchLoadFailure`,
 `ClearDispatchLoadCooldown`) resolve the gate and take `gate.mu` through
 `lockGate` (`coordinator/registry/gate_lock.go`), never `r.mu`; `lockGate`
 re-validates under the lock that the gate is still the session's current one
-and not retired, and re-resolves otherwise. The scan reads the breaker and
+and not retired, and re-resolves otherwise. A missing identity makes a
+clear operation a no-op. After `gateRelockMaxRetries` optimistic retries,
+`lockGateWithIndex` holds `gatesMu` through resolution and gate acquisition
+so a recorder always writes to a validated identity. The scan reads the breaker and
 ejection verdicts from atomics (`breakerOpenAt`, `ejectedAt`) and takes
 `gate.mu` only for a provider whose flag word (`pairFlags`) says it holds
 per-model state, so a provider with no fault state costs a few atomic loads.
+
+Version-reset history and disconnect-flush tags live under the same identity
+mutex (`coordinator/registry/version_reset.go`). `disconnectSource` captures
+the session before acquiring the gate and compares its disconnect timestamp
+with `gateState.versionResetAt` while the mutation lock is held. This preserves
+the [restart behavior](scheduling.md#disconnect) without returning terminal
+recorders to the fleet lock. `RecordCapacityAcceptObserved` likewise replays
+only rejection strikes newer than the accepted observation, retaining a newer
+cooldown or clamp even when accept bookkeeping arrives late.
 
 **Identity rebinds** (`coordinator/registry/gate_migrate.go`). `bindStableFaultKey`
 runs at every (re-)attestation and at account linkage, under the session's

@@ -234,6 +234,24 @@ type InferenceRouteOutcome struct {
 	// is loud rather than silent. json:"-" keeps it out of every API payload and
 	// neither store impl persists it.
 	InvalidTTFT bool `json:"-"`
+
+	// QueueExit is a transient (never-persisted) marker on the terminal outcome
+	// of a request that left the coordinator queue without a provider attempt
+	// being dispatched (client gone, queue_deadline, queue_timeout,
+	// ttft_too_slow, tool-constraint unavailable). The route-outcome funnel
+	// counts such an exit on inference.queue_outcome instead of
+	// inference.attempt_outcome, so the per-model attempt denominator only
+	// counts attempts a provider actually received.
+	QueueExit bool `json:"-"`
+}
+
+// InferenceRouteOutcomeUpdate is one outcome update addressed to a route row,
+// used by the batched UpdateInferenceRouteOutcomes path. It carries exactly the
+// arguments of UpdateInferenceRouteOutcome; Outcome nil is skipped.
+type InferenceRouteOutcomeUpdate struct {
+	RequestID string
+	Attempt   int
+	Outcome   *InferenceRouteOutcome
 }
 
 // RejectionRecord captures a single rejected inbound inference request (4xx/5xx)

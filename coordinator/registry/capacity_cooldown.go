@@ -352,6 +352,9 @@ func (r *Registry) claimCapacityProbeRef(ref gateRef, model string, now time.Tim
 		return true
 	}
 	hold := r.lockGate(ref, "capacity_probe")
+	if hold.g == nil {
+		return true
+	}
 	// Release directly, not via hold.unlock(): the caller holds p.mu (and
 	// r.mu in global commit mode), and the observer's DogStatsD emit must
 	// never run inside those sections. The probe's gate wait is therefore not
@@ -462,6 +465,10 @@ func (r *Registry) RecordCapacityAcceptObserved(providerID, modelID string, obse
 	hold := r.lockGate(ref, "capacity_accept")
 	defer hold.unlock()
 	g := hold.g
+	if g == nil {
+		return false
+	}
+
 	now := time.Now()
 	if observedAt.IsZero() || observedAt.After(now) {
 		observedAt = now

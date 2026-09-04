@@ -26,11 +26,11 @@ import (
 // atomic loads.
 //
 // LOCK ORDER: r.mu → p.mu → r.gatesMu → gate.mu. Never acquire r.mu or p.mu
-// while holding gatesMu or a gate.mu. gatesMu is insert-only from the request
-// path's point of view: recorders and readers take it for READING (session →
-// gate resolution); it is written only by Register, Disconnect, the
+// while holding gatesMu or a gate.mu. Recorders normally take gatesMu for
+// READING (session → gate resolution); first insertion and the rare exhausted
+// retry in lockGateWithIndex take it for writing. Register, Disconnect, the
 // attestation-time identity bind (under the session's p.mu) and the periodic
-// sweep. Only the identity
+// sweep also write the index. Only the identity
 // migration (migrateGateLocked, under gatesMu.Lock) ever holds two gate.mu at
 // once, so there is no ordering problem between gates. There is deliberately
 // NO walk-wide gates lock on the scan: a lock taken for the whole fleet walk
@@ -137,8 +137,11 @@ type gateState struct {
 	ejectionLastTripCapacity bool
 
 	// Inference-error breaker, per (model, shape) (error_cooldown.go).
-	inferenceErrorStrikes   map[modelShapeKey][]time.Time
-	inferenceErrorCooldowns map[modelShapeKey]time.Time
+	inferenceErrorStrikes      map[modelShapeKey][]time.Time
+	inferenceErrorCooldowns    map[modelShapeKey]time.Time
+	inferenceErrorFlushStrikes map[modelShapeKey][]time.Time
+	identityVersion            string
+	versionResetAt             time.Time
 
 	// Per-model trackers, keyed by model id.
 	dispatchLoadCooldowns map[string]time.Time              // registry.go

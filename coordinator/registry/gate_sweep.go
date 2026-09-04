@@ -46,6 +46,7 @@ func (g *gateState) pruneLocked(r *Registry, now time.Time) (idle bool) {
 	for k, strikes := range g.inferenceErrorStrikes {
 		if len(strikes) == 0 || !strikes[len(strikes)-1].Add(inferenceErrorWindow).After(now) {
 			delete(g.inferenceErrorStrikes, k)
+			delete(g.inferenceErrorFlushStrikes, k)
 		}
 	}
 	window := r.capacityCooldownCfg.Window

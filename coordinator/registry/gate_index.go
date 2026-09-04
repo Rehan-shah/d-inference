@@ -184,9 +184,11 @@ func (r *Registry) gateOf(p *Provider) *gateState {
 // Which reads confirm: everything that feeds a dispatch decision — the
 // routing gate (gateStateReasonLocked: the scan, the commit's admit re-check
 // and the preflight), the snapshot's budget clamp (budgetClampedFor) and the
-// candidate's capacity-rate penalty (capacityRatePenaltyFor). Tallies,
-// classification counts, fleet_sample rows and warm-pool planning read gateOf
-// unconfirmed: a stale sample there miscounts once and dispatches nothing.
+// candidate's capacity-rate penalty (capacityRatePenaltyFor). Rejected-provider
+// classification (classifyRejectedProvider) also confirms its view because it
+// controls the fail-open rescan and capacity/no-provider response. Gate tallies,
+// fleet_sample rows and warm-pool planning read gateOf unconfirmed: a stale
+// sample there miscounts once and dispatches nothing.
 //
 // No retired check: the sweep drops only gates with no live session, and
 // every read site holds r.mu (Disconnect removes the session under
@@ -251,13 +253,17 @@ func (r *Registry) detachSessionGate(p *Provider, stableID string) {
 	r.gatesMu.Lock()
 	defer r.gatesMu.Unlock()
 	r.gatesInitLocked()
+	// Live references and later disconnect-cache lookups must date the same
+	// event identically when comparing it with a concurrent version reset.
+	disconnectedAt := time.Now()
+	p.gateDisconnectedAtNS.Store(disconnectedAt.UnixNano())
 	delete(r.sessions, p.ID)
 	g := p.gate.Load()
 	if g != nil {
 		g.live--
 	}
 	if stableID != "" {
-		r.rememberDisconnectedStableIDLocked(p.ID, stableID)
+		r.rememberDisconnectedStableIDLocked(p.ID, stableID, disconnectedAt)
 		return
 	}
 	if g != nil && g.key == p.ID && g.live <= 0 && r.gates[p.ID] == g {

@@ -78,9 +78,17 @@ func (r *Registry) RecordInferenceError(providerID, modelID string, statusCode i
 		return false
 	}
 
+	var source disconnectSource
+	if statusCode == disconnectFlushStatusCode {
+		source = r.captureDisconnectSource(providerID)
+	}
 	hold := r.lockGate(r.gateForSession(providerID), "inference_error")
 	defer hold.unlock()
 	g := hold.g
+	if statusCode == disconnectFlushStatusCode && source.supersededBy(g) {
+		return false
+	}
+
 	now := time.Now()
 	defer g.updatedLocked(now)
 
@@ -96,6 +104,10 @@ func (r *Registry) RecordInferenceError(providerID, modelID string, statusCode i
 	}
 	kept = append(kept, now)
 	g.inferenceErrorStrikes[key] = kept
+	g.pruneInferenceFlushStrikesLocked(key, now)
+	if statusCode == disconnectFlushStatusCode {
+		g.noteInferenceFlushStrikeLocked(key, now)
+	}
 
 	if len(kept) < inferenceErrorThreshold {
 		return false
@@ -117,12 +129,17 @@ func (r *Registry) RecordInferenceError(providerID, modelID string, statusCode i
 // deterministic tool failure interleaved with text traffic could never trip
 // the breaker (the original incident).
 func (r *Registry) RecordInferenceSuccess(providerID, modelID, shape string) {
-	hold := r.lockGate(r.gateForSession(providerID), "inference_success")
+	hold := r.lockGate(r.lookupSessionGateRef(providerID), "inference_success")
 	defer hold.unlock()
 	g := hold.g
+	if g == nil {
+		return
+	}
+
 	key := modelShapeKey{Model: modelID, Shape: shape}
 	delete(g.inferenceErrorStrikes, key)
 	delete(g.inferenceErrorCooldowns, key)
+	delete(g.inferenceErrorFlushStrikes, key)
 	g.updatedLocked(time.Now())
 }
 

@@ -350,6 +350,10 @@ func (r *Registry) releaseBudgetClampsOnHeartbeat(providerID string, heartbeatAt
 	hold := r.lockGate(ref, "clamp_heartbeat")
 	defer hold.unlock()
 	g := hold.g
+	if g == nil {
+		return
+	}
+
 	now := time.Now()
 	for _, slot := range capacity.Slots {
 		rawRemaining := slot.ActiveTokenBudgetMax - slot.ActiveTokenBudgetUsed - slot.QueuedTokenBudget

@@ -63,9 +63,9 @@ func (ref gateRef) currentLocked(g *gateState) bool {
 // went stale between the index lookup and the lock, and how many times a
 // routing read re-reads a gate the session moved away from (gateView.moved).
 // One retry is the expected maximum (a rebind or a sweep landed in the
-// window); the bound only guarantees termination under an adversarial
-// schedule, where the recorder falls back to the gate it holds and the reader
-// to the last view it read — today's behaviour, no worse.
+// window). A recorder that exhausts the optimistic retries stabilizes the
+// index while resolving and acquiring the gate; it never mutates a stale
+// gate merely to bound the number of retries.
 const gateRelockMaxRetries = 4
 
 // lockGate acquires gate.mu for a recorder at the named site. It follows any
@@ -76,12 +76,24 @@ const gateRelockMaxRetries = 4
 // The uncontended path is one TryLock — no clock reads; only a contended
 // acquisition is timed, and only a wait above gateWaitReportThreshold is
 // reported. The caller uses hold.g (the gate actually locked) and calls
-// hold.unlock.
+// hold.unlock. A vanished no-insert identity returns a nil gate; callers must
+// treat that hold as a no-op.
 func (r *Registry) lockGate(ref gateRef, site string) gateHold {
+	return r.lockGateWithRetries(ref, site, 0)
+}
+
+// lockGateWithRetries carries the optimistic retry count explicitly so the
+// exhaustion path can be exercised without scheduling several racing rebinds.
+func (r *Registry) lockGateWithRetries(ref gateRef, site string, retries int) gateHold {
 	var wait time.Duration
 	g := ref.g
-	retries := 0
 	for {
+		if retries >= gateRelockMaxRetries {
+			return r.lockGateWithIndex(ref, site, wait)
+		}
+		if g == nil {
+			return gateHold{r: r, site: site, wait: wait}
+		}
 		if !g.mu.TryLock() {
 			start := time.Now()
 			g.mu.Lock()
@@ -90,28 +102,49 @@ func (r *Registry) lockGate(ref gateRef, site string) gateHold {
 		if next := g.forwardTo.Load(); next != nil {
 			g.mu.Unlock()
 			g = next
+			retries++
 			continue
 		}
-		if retries >= gateRelockMaxRetries || ref.currentLocked(g) {
+		if ref.currentLocked(g) {
 			return gateHold{g: g, r: r, site: site, wait: wait}
 		}
-		// Stale: the sweep retired g, or the session rebound to another gate
-		// while we were between the index and the lock. Release, re-resolve
-		// through the index and try again.
+		// Never retain g after a failed validation: it may still belong to
+		// another live session even if this session's next lookup is empty.
 		g.mu.Unlock()
 		retries++
-		fresh := r.reresolveGate(ref)
-		if fresh.g == nil {
-			// A no-insert ref (a clear) whose identity has no gate any more:
-			// nothing left to clear. Keep the retired gate — its state is out
-			// of the index, so the write is a no-op — rather than file a gate
-			// under an identity nothing references.
-			fresh.g = g
-			retries = gateRelockMaxRetries
+		if retries >= gateRelockMaxRetries {
+			continue
 		}
-		ref = fresh
-		g = fresh.g
+		ref = r.reresolveGate(ref)
+		g = ref.g
 	}
+}
+
+// lockGateWithIndex is the rare retry-exhaustion path. Holding gatesMu until
+// the current gate is locked prevents a rebind or sweep from invalidating the
+// resolution. The index lock is released before returning the gate, preserving
+// gatesMu -> gate.mu without taking r.mu or p.mu. The write lock permits an
+// inserting recorder to recreate an idle gate retired by a concurrent sweep.
+func (r *Registry) lockGateWithIndex(ref gateRef, site string, wait time.Duration) gateHold {
+	start := time.Now()
+	r.gatesMu.Lock()
+	defer r.gatesMu.Unlock()
+	key := ref.key
+	var g *gateState
+	if key != "" {
+		g = r.gates[key]
+	} else {
+		g, key, _ = r.resolveSessionGateLocked(ref.session)
+	}
+	if g == nil && ref.insert {
+		g = r.ensureGateLocked(key, time.Now())
+	}
+	g = g.resolve()
+	if g == nil {
+		return gateHold{r: r, site: site, wait: wait + time.Since(start)}
+	}
+	g.mu.Lock()
+	return gateHold{g: g, r: r, site: site, wait: wait + time.Since(start)}
 }
 
 // reresolveGate resolves ref again through the index (takes gatesMu; the
@@ -137,8 +170,13 @@ func (r *Registry) reresolveGate(ref gateRef) gateRef {
 func (r *Registry) refHasPairState(ref gateRef, flag uint32) (gateRef, bool) {
 	for retries := 0; ; retries++ {
 		has := ref.g.hasPairState(flag)
-		if has || retries >= gateRelockMaxRetries || ref.p == nil || ref.p.gate.Load() == ref.g {
+		if has || ref.p == nil || ref.p.gate.Load() == ref.g {
 			return ref, has
+		}
+		if retries >= gateRelockMaxRetries {
+			// A stale false flag cannot prove there is nothing to clear or
+			// claim. Force the caller through lockGate's validated acquisition.
+			return ref, true
 		}
 		ref = r.reresolveGate(ref)
 	}
@@ -155,8 +193,10 @@ type gateHold struct {
 }
 
 func (h gateHold) unlock() {
-	h.g.mu.Unlock()
-	if h.wait > gateWaitReportThreshold {
+	if h.g != nil {
+		h.g.mu.Unlock()
+	}
+	if h.r != nil && h.wait > gateWaitReportThreshold {
 		if obs := h.r.gateWaitObserver.Load(); obs != nil {
 			(*obs)(h.site, h.wait)
 		}

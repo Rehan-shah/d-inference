@@ -52,6 +52,18 @@ func (g *gateState) resolve() *gateState {
 // later clamp time wins whole. Caller holds BOTH g.mu and src.mu (only the
 // identity bind, under gatesMu.Lock, ever does).
 func (g *gateState) mergeLocked(src *gateState) {
+	if g.identityVersion == "" {
+		g.identityVersion = src.identityVersion
+	}
+	if src.versionResetAt.After(g.versionResetAt) {
+		g.versionResetAt = src.versionResetAt
+	}
+	if len(src.inferenceErrorFlushStrikes) > 0 && g.inferenceErrorFlushStrikes == nil {
+		g.inferenceErrorFlushStrikes = make(map[modelShapeKey][]time.Time)
+	}
+	for key, stamps := range src.inferenceErrorFlushStrikes {
+		g.inferenceErrorFlushStrikes[key] = mergeChronologicalTimestamps(g.inferenceErrorFlushStrikes[key], stamps)
+	}
 	for model, expiry := range src.dispatchLoadCooldowns {
 		if cur, ok := g.dispatchLoadCooldowns[model]; !ok || expiry.After(cur) {
 			g.dispatchLoadCooldowns[model] = expiry
@@ -135,6 +147,9 @@ func (g *gateState) mergeLocked(src *gateState) {
 // After a migration the source key starts from nothing, as the old map-keyed
 // implementation left it. Caller holds g.mu.
 func (g *gateState) resetLocked() {
+	g.identityVersion = ""
+	g.versionResetAt = time.Time{}
+	clear(g.inferenceErrorFlushStrikes)
 	g.outcomes, g.breakerUntil, g.breakerTrips = nil, time.Time{}, 0
 	g.ejection, g.ejectionUntil, g.ejectionTrips = nil, time.Time{}, 0
 	g.ejectionCapacityStreak, g.ejectionLastTripCapacity = capacityStreak{}, false
@@ -195,6 +210,12 @@ func (r *Registry) bindStableFaultKey(p *Provider, stableID string) {
 	}
 	cur := p.gate.Load()
 	if cur != nil && cur.key == targetKey {
+		if stableID != "" {
+			cur.mu.Lock()
+			cur.noteIdentityVersionLocked(r, p.Version)
+			cur.updatedLocked(now)
+			cur.mu.Unlock()
+		}
 		return
 	}
 	target := r.ensureGateLocked(targetKey, now)
@@ -216,6 +237,12 @@ func (r *Registry) bindStableFaultKey(p *Provider, stableID string) {
 		r.migrateGateLocked(p, cur, target, cur.live <= 1)
 	} else {
 		p.gate.Store(target)
+	}
+	if stableID != "" {
+		target.mu.Lock()
+		target.noteIdentityVersionLocked(r, p.Version)
+		target.updatedLocked(now)
+		target.mu.Unlock()
 	}
 	target.live++
 	if cur != nil {

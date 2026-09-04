@@ -270,8 +270,8 @@ func TestStaleRefSurvivesSweepOfDisconnectedGate(t *testing.T) {
 }
 
 // A CLEAR recorder (no-insert resolution) whose gate was swept in the window
-// has nothing left to clear: it keeps the retired gate — its write is a no-op
-// — rather than file a gate under an identity nothing references.
+// has nothing left to clear: it returns a nil hold rather than retaining the
+// old gate or filing a gate under an identity nothing references.
 func TestClearRefNeverFilesAGateForASweptIdentity(t *testing.T) {
 	const key = "serial:SER-CLEAR-RACE"
 	reg := New(testLogger())
@@ -289,9 +289,9 @@ func TestClearRefNeverFilesAGateForASweptIdentity(t *testing.T) {
 		t.Fatal("precondition: the sweep must drop the idle disconnected gate")
 	}
 	hold := reg.lockGate(ref, "test")
-	if hold.g != stale {
+	if hold.g != nil {
 		hold.unlock()
-		t.Fatalf("a clear re-resolved to %q; it must keep the retired gate", hold.g.key)
+		t.Fatalf("a clear re-resolved to %q; it must return a no-op hold", hold.g.key)
 	}
 	hold.unlock()
 	if rawGateForKey(reg, key) != nil || rawGateForKey(reg, p.ID) != nil {
@@ -299,6 +299,7 @@ func TestClearRefNeverFilesAGateForASweptIdentity(t *testing.T) {
 	}
 	// Through the real recorder, on the dead session: still nothing filed.
 	reg.ClearDispatchLoadCooldown(p.ID, "m")
+	reg.RecordInferenceSuccess(p.ID, "m", "base")
 	if reg.gateCount() != 0 {
 		t.Fatalf("gate index after a straggling clear = %d, want 0", reg.gateCount())
 	}

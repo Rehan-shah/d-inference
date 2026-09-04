@@ -853,7 +853,12 @@ type Provider struct {
 	// distinguish "never enrolled" from "enrolled but unresponsive".
 	MDMFailureReason string
 
-	Status           ProviderStatus
+	Status ProviderStatus
+	// drainingUntil is non-zero while the provider has declared itself
+	// draining (heartbeat status "draining" or a typed draining rejection);
+	// routing skips it until its next idle/serving heartbeat or the TTL
+	// (drain_state.go). Guarded by p.mu.
+	drainingUntil    time.Time
 	Conn             *websocket.Conn
 	writer           *providerWriter
 	LastHeartbeat    time.Time
@@ -1046,7 +1051,8 @@ type Provider struct {
 	// the recorders (without p.mu) read it without another lock; written only
 	// under r.gatesMu (attachSessionGate / bindStableFaultKey). nil for a bare
 	// test Provider — every gate read treats nil as "no state".
-	gate atomic.Pointer[gateState]
+	gate                 atomic.Pointer[gateState]
+	gateDisconnectedAtNS atomic.Int64
 }
 
 // providerSupportsPrivateTextLocked is the SINGLE routing chokepoint for
@@ -2128,6 +2134,13 @@ type Registry struct {
 	providers map[string]*Provider
 
 	queue *RequestQueue
+	// drainSuppress rate-limits HEARTBEAT-triggered queue drains per model
+	// after a saturated pass (queue_drain_suppress.go). Zero value ready.
+	drainSuppress queueDrainSuppressor
+	// drainPasses runs one queue-drain pass per model at a time and reruns it
+	// for triggers that landed mid-pass (queue_drain_coalesce.go). Zero value
+	// ready.
+	drainPasses queueDrainCoalescer
 
 	MinTrustLevel TrustLevel
 
@@ -2213,6 +2226,10 @@ type Registry struct {
 	// shared reading after winner selection and before the serialized commit.
 	// Production leaves it nil; tests set it before starting concurrent scans.
 	reservationAfterScan func(model string)
+	// drainBeforePop is a test-only barrier invoked with no locks held before
+	// every pop of a queue-drain pass, so a test can interleave a trigger at a
+	// chosen point of the pass. Production leaves it nil.
+	drainBeforePop func(model string)
 
 	// modelIndex maps advertised model id → providers advertising it, so the
 	// per-request fleet walks visit only providers that can pass the first
@@ -2466,6 +2483,10 @@ func (r *Registry) ClearDispatchLoadCooldown(providerID, modelID string) {
 	hold := r.lockGate(ref, "dispatch_load_clear")
 	defer hold.unlock()
 	g := hold.g
+	if g == nil {
+		return
+	}
+
 	delete(g.dispatchLoadCooldowns, modelID)
 	g.updatedLocked(time.Now())
 }
@@ -4059,6 +4080,10 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	// loaded. Clear stale state so challenge checks never compare against a
 	// provider-injected identifier.
 	p.CurrentModel = currentModel
+	// Drain awareness (drain_state.go): "draining" arms the routing skip,
+	// "idle"/"serving" clear it. Independent of p.Status below — a draining
+	// provider keeps its online/serving accounting; only routing changes.
+	applyHeartbeatDrainStateLocked(p, msg.Status, now)
 	// Only update status from heartbeat if provider is not actively serving
 	// (serving status is managed by request lifecycle). Crucially, an
 	// untrusted provider must NOT transition back to StatusOnline here —
@@ -4095,8 +4120,10 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 
 	// Heartbeats can make a recovered slot routable again (for example after a
 	// crash auto-restart). Drain matching queues using the canonical scheduler
-	// rather than the legacy direct queue assignment path.
-	r.drainQueuedRequestsForModelsWithReason(providerModelIDs(p), DrainTriggerHeartbeat)
+	// rather than the legacy direct queue assignment path. Heartbeats are the
+	// one trigger that is rate-limited after a saturated pass
+	// (queue_drain_suppress.go); every capacity-freeing trigger drains at once.
+	r.drainQueuedRequestsForHeartbeat(providerModelIDs(p))
 
 	// If queue drain didn't satisfy all pending requests (no warm provider),
 	// check if a cold provider should swap models to serve queued demand —
@@ -4942,8 +4969,19 @@ func mergeHeartbeatSessionStats(previous, current protocol.HeartbeatStats) proto
 	return merged
 }
 
-// Disconnect removes a provider from the registry and cleans up pending requests.
+// Disconnect removes a provider from the registry and cleans up pending
+// requests. This is the ABRUPT path: the flushed terminals carry
+// CoordinatorCauseProviderDisconnected and strike the provider's stable
+// identity. The provider read loop, which knows how the socket ended, calls
+// DisconnectWithReason (disconnect_reason.go) so a graceful peer close flushes
+// with the health-neutral restart cause instead.
 func (r *Registry) Disconnect(id string) {
+	r.disconnectWithCause(id, protocol.CoordinatorCauseProviderDisconnected)
+}
+
+// disconnectWithCause is the shared Disconnect implementation; cause is
+// stamped on every flushed pending-request terminal.
+func (r *Registry) disconnectWithCause(id string, cause protocol.CoordinatorInferenceErrorCause) {
 	var disconnectedModels []string
 	r.mu.Lock()
 	p, ok := r.providers[id]
@@ -5021,7 +5059,8 @@ func (r *Registry) Disconnect(id string) {
 					RequestID:        reqID,
 					Error:            "provider disconnected",
 					StatusCode:       502,
-					CoordinatorCause: protocol.CoordinatorCauseProviderDisconnected,
+					ErrorReason:      disconnectFlushErrorReason(cause),
+					CoordinatorCause: cause,
 				}
 			}()
 			func() {
