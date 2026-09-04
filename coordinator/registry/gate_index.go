@@ -116,7 +116,7 @@ func (r *Registry) sessionGateRefLocked(sessionID string, insert bool) (gateRef,
 	g, key, via := r.resolveSessionGateLocked(sessionID)
 	ref := gateRef{g: g, p: via, session: sessionID, insert: insert}
 	if via == nil {
-		if cached, ok := r.disconnectedStableIDs[sessionID]; ok && cached.id == key && time.Since(cached.at) < disconnectedStableIDTTL {
+		if cached, ok := r.disconnectedStableIDs[sessionID]; ok && cached.id == key {
 			ref.disconnectedBinding = cached.binding
 		}
 	}
