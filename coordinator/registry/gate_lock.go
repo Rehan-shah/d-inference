@@ -35,10 +35,14 @@ type gateRef struct {
 	g *gateState
 	// p is the live session whose cached p.gate produced g; nil when g was
 	// reached through the disconnect cache, the bare session id or an
-	// explicit fault key (nothing can rebind those). After the lock,
+	// explicit fault key. After the lock,
 	// p.gate.Load() != g means the session rebound to another gate in
 	// between and the outcome belongs there.
 	p *Provider
+	// A disconnected identity can still be enriched by a live sibling. Its
+	// cache-owned redirect validates that move without retaining Provider or
+	// acquiring gatesMu while gate.mu is held.
+	disconnectedBinding *disconnectedGateBinding
 	// Exactly one of session / key names what to re-resolve.
 	session string
 	key     string
@@ -56,7 +60,22 @@ func (ref gateRef) currentLocked(g *gateState) bool {
 	if g.retired {
 		return false
 	}
-	return ref.p == nil || ref.p.gate.Load() == g
+	return ref.bindingCurrent(g)
+}
+
+// bindingCurrent is safe for the lock-free pair-flag probe as well as the
+// locked validation. All identity redirects publish before resetting src.
+func (ref gateRef) bindingCurrent(g *gateState) bool {
+	if ref.p != nil {
+		// A ref captured while live must switch to the disconnect cache on
+		// drop; a later sibling enrichment redirects that cache, not this
+		// detached Provider's cached gate pointer.
+		return ref.p.gateDisconnectedAtNS.Load() == 0 && ref.p.gate.Load() == g
+	}
+	if ref.disconnectedBinding != nil {
+		return g != nil && ref.disconnectedBinding.load() == g.key
+	}
+	return true
 }
 
 // gateRelockMaxRetries bounds how many times lockGate re-resolves a gate that
@@ -170,7 +189,7 @@ func (r *Registry) reresolveGate(ref gateRef) gateRef {
 func (r *Registry) refHasPairState(ref gateRef, flag uint32) (gateRef, bool) {
 	for retries := 0; ; retries++ {
 		has := ref.g.hasPairState(flag)
-		if has || ref.p == nil || ref.p.gate.Load() == ref.g {
+		if has || ref.bindingCurrent(ref.g) {
 			return ref, has
 		}
 		if retries >= gateRelockMaxRetries {

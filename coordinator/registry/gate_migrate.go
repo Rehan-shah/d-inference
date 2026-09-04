@@ -267,6 +267,10 @@ func (r *Registry) migrateGateLocked(p *Provider, src, dst *gateState, orphan bo
 	dst.mergeLocked(src)
 	dst.publishLocked()
 	p.gate.Store(dst)
+	// Redirect cached disconnected sessions while src.mu is still held, so
+	// a recorder that resolved src before this migration cannot write into
+	// the reset source when it remains live for an unenriched sibling.
+	r.retargetDisconnectedGateBindingsLocked(src.key, dst.key)
 	if orphan {
 		// Forward BEFORE resetting, and never republish the orphan: a
 		// lock-free reader that loaded src sees either its intact pre-merge

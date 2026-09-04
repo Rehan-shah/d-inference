@@ -92,14 +92,35 @@ func (r *Registry) lookupGateForSession(sessionID string) *gateState {
 
 func (r *Registry) sessionGateRef(sessionID string, insert bool) gateRef {
 	r.gatesMu.RLock()
-	g, key, via := r.resolveSessionGateLocked(sessionID)
+	ref, _ := r.sessionGateRefLocked(sessionID, insert)
 	r.gatesMu.RUnlock()
-	if g == nil && insert {
+	if ref.g == nil && insert {
 		r.gatesMu.Lock()
-		g = r.ensureGateLocked(key, time.Now())
+		// The session or cached identity may have changed since the miss.
+		// Resolve again before inserting so an enrichment cannot recreate
+		// state under the disconnected session's obsolete key.
+		var key string
+		ref, key = r.sessionGateRefLocked(sessionID, insert)
+		if ref.g == nil {
+			ref.g = r.ensureGateLocked(key, time.Now())
+		}
 		r.gatesMu.Unlock()
 	}
-	return gateRef{g: g.resolve(), p: via, session: sessionID, insert: insert}
+	ref.g = ref.g.resolve()
+	return ref
+}
+
+// sessionGateRefLocked captures the cached binding in the same index read as
+// the gate. Caller holds gatesMu (either mode).
+func (r *Registry) sessionGateRefLocked(sessionID string, insert bool) (gateRef, string) {
+	g, key, via := r.resolveSessionGateLocked(sessionID)
+	ref := gateRef{g: g, p: via, session: sessionID, insert: insert}
+	if via == nil {
+		if cached, ok := r.disconnectedStableIDs[sessionID]; ok && cached.id == key && time.Since(cached.at) < disconnectedStableIDTTL {
+			ref.disconnectedBinding = cached.binding
+		}
+	}
+	return ref, key
 }
 
 // resolveSessionGateLocked returns the gate a session resolves to (nil when

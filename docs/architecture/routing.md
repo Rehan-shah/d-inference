@@ -1,6 +1,6 @@
 # Routing: how a request becomes a provider choice
 
-> Last updated: 2026-09-04 · commit `16cbbf6da`
+> Last updated: 2026-09-04 · commit `07d3056d5`
 
 Routing is the part of the coordinator that, given one inference request and
 the live fleet, picks the provider that should run it. It filters the fleet
@@ -516,7 +516,13 @@ state to the refined identity (`migrateGateLocked`; merge policy
 `mergeLocked`: expiries and trip counts take the max, histories merge
 chronologically) and empties the source: an orphaned source is forwarded
 (`forwardTo`) so stale pointers land on the live state; a source still bound
-to a sibling session is reset and republished. Because the bind holds
+to a sibling session is reset and republished. Cached disconnected identities
+follow the refined identity without changing their disconnect timestamps.
+Their recorder references carry a `disconnectedGateBinding`
+(`coordinator/registry/gate_disconnected_binding.go`), updated under the source
+gate's mutex and validated on acquisition, so an in-flight late flush cannot
+recreate or write into the former identity after a shared-source migration.
+Because the bind holds
 `p.mu`, a section that reads `p.gate` under `p.mu` — the scan's gate chain,
 the commit through its debit, the alias resolver's `providerCanRouteBuildLocked`
 — never sees the identity change underneath it. The one dispatch-deciding

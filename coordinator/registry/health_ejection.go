@@ -189,6 +189,9 @@ func mergeChronologicalTimestamps(dst, src []time.Time) []time.Time {
 type disconnectedStableID struct {
 	id string
 	at time.Time
+	// binding is shared only with short-lived recorder refs, not Provider.
+	// Identity migration updates it under the old gate's mutex before reset.
+	binding *disconnectedGateBinding
 }
 
 // disconnectedStableIDTTL bounds how long a disconnected provider's cached stable
@@ -210,7 +213,7 @@ func (r *Registry) rememberDisconnectedStableIDLocked(sessionID, stableID string
 			}
 		}
 	}
-	r.disconnectedStableIDs[sessionID] = disconnectedStableID{id: stableID, at: disconnectedAt}
+	r.disconnectedStableIDs[sessionID] = disconnectedStableID{id: stableID, at: disconnectedAt, binding: newDisconnectedGateBinding(stableID)}
 }
 
 // RecordProviderServeOutcome feeds one terminal outcome into the stable-identity

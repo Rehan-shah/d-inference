@@ -43,6 +43,7 @@ func TestParseReserveCommitMode(t *testing.T) {
 			t.Errorf("parseReserveCommitMode(%q) = (%s, %v), want (%s, %v)", raw, mode, known, want.mode, want.known)
 		}
 	}
+	t.Setenv(envReserveCommitMode, "")
 	if New(testLogger()).reserveCommitMode != reserveCommitShared {
 		t.Fatal("a registry built without EIGENINFERENCE_RESERVE_COMMIT_MODE must default to shared")
 	}
