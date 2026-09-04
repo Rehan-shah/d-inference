@@ -103,6 +103,44 @@ struct UpdateDrainAwarenessTests {
         #expect(try await heartbeatObject(client)["status"] as? String == "idle")
     }
 
+    @Test("the encode-failure fallback heartbeat carries the computed status, not a literal idle")
+    func encodeFailureFallbackKeepsComputedStatus() async throws {
+        let state = ProviderState()
+        let client = makeHeartbeatClient(state: state)
+        // JSONEncoder's default non-conforming-float strategy is .throw, so a
+        // NaN in the capacity payload forces the catch branch deterministically;
+        // the fallback must be the minimal frame (no backend_capacity) but with
+        // the status the drain/serving logic computed.
+        state.backendCapacity = BackendCapacity(
+            slots: [], gpuMemoryActiveGb: .nan, gpuMemoryPeakGb: 0, gpuMemoryCacheGb: 0,
+            totalMemoryGb: 128)
+
+        state.refusingNewWork = true
+        var fallback = try await heartbeatObject(client)
+        #expect(fallback["backend_capacity"] == nil)
+        #expect(fallback["type"] as? String == "heartbeat")
+        #expect(fallback["status"] as? String == "draining")
+
+        state.refusingNewWork = false
+        state.inferenceActive = true
+        fallback = try await heartbeatObject(client)
+        #expect(fallback["backend_capacity"] == nil)
+        #expect(fallback["status"] as? String == "serving")
+
+        state.inferenceActive = false
+        fallback = try await heartbeatObject(client)
+        #expect(fallback["backend_capacity"] == nil)
+        #expect(fallback["status"] as? String == "idle")
+
+        // A finite payload encodes normally again.
+        state.backendCapacity = BackendCapacity(
+            slots: [], gpuMemoryActiveGb: 1, gpuMemoryPeakGb: 1, gpuMemoryCacheGb: 0,
+            totalMemoryGb: 128)
+        let normal = try await heartbeatObject(client)
+        #expect(normal["backend_capacity"] != nil)
+        #expect(normal["status"] as? String == "idle")
+    }
+
     @Test("beginUpdateDraining flips the phase and the shared flag the heartbeat reads")
     func beginUpdateDrainingFlipsHeartbeatStatus() async throws {
         let loop = try makeDrainTestLoop()

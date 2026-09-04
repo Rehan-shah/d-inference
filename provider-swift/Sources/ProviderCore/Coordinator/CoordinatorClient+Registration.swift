@@ -128,9 +128,12 @@ extension CoordinatorClient {
             return json
         } catch {
             recordEncodeFailure("heartbeat", error)
-            // Last resort: a valid idle heartbeat keeps the connection alive
+            // Last resort: a minimal valid heartbeat keeps the connection alive
             // rather than shipping malformed bytes the coordinator would drop.
-            return "{\"type\":\"heartbeat\",\"status\":\"idle\",\"stats\":{\"requests_served\":0,\"tokens_generated\":0},\"system_metrics\":{\"memory_pressure\":0,\"cpu_usage\":0,\"thermal_state\":\"nominal\"}}"
+            // It carries the status computed above — a draining box must not
+            // announce itself idle just because its capacity payload failed to
+            // encode, or the coordinator keeps routing to it.
+            return "{\"type\":\"heartbeat\",\"status\":\"\(status.rawValue)\",\"stats\":{\"requests_served\":0,\"tokens_generated\":0},\"system_metrics\":{\"memory_pressure\":0,\"cpu_usage\":0,\"thermal_state\":\"nominal\"}}"
         }
     }
 
