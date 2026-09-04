@@ -1,6 +1,6 @@
 # Routing: how a request becomes a provider choice
 
-> Last updated: 2026-09-04 · commit `589023969`
+> Last updated: 2026-09-04 · commit `45c310e00`
 
 Routing is the part of the coordinator that, given one inference request and
 the live fleet, picks the provider that should run it. It filters the fleet
@@ -456,7 +456,7 @@ the request path takes it for writing.
 |---|---|---|
 | `Registry.mu` (`sync.RWMutex`, `coordinator/registry/registry.go`) | The provider map, catalog, aliases and routing configuration. | The scan and the commit, for READING (`scanProviderReservation`, `commitLock`). Writers are `Register`, `Disconnect`, `evictStale`, the swap planner and the config setters. |
 | `Provider.mu` | One provider's heartbeat state, pending set, attestation and cached gate pointer (`Provider.gate`). | The scan per provider (`snapshotProviderIntoLockedEx`); the commit's whole decide-and-debit section; the identity bind (`bindStableFaultKey`). |
-| `Registry.gatesMu` (`sync.RWMutex`) | The gate index: fault key → `gateState`, session → `Provider` (`coordinator/registry/gate_index.go`). | Recorders for READING (session → gate resolution) and for the one insert a new identity needs (`ensureGateLocked`). Also written by `attachSessionGate`, `detachSessionGate`, `bindStableFaultKey` and `sweepGates`. |
+| `Registry.gatesMu` (`sync.RWMutex`) | The gate index: fault key → `gateState`, session → `Provider` (`coordinator/registry/gate_index.go`). | Recorders for READING (session → gate resolution), first insertion (`ensureGateLocked`), and the rare validated retry fallback (`lockGateWithIndex`). Also written by `attachSessionGate`, `detachSessionGate`, `bindStableFaultKey` and `sweepGates`. |
 | `gateState.mu` | One identity's fault trackers (`coordinator/registry/gate_state.go`). | Recorders (`lockGate`), the commit's probe claim (`tryClaimCapacityProbe`), the per-model gate reads. Microseconds, per identity. |
 
 Lock order: `r.mu → p.mu → gatesMu → gate.mu`. `r.mu` or `p.mu` is never
