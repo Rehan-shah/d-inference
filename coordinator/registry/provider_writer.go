@@ -11,8 +11,12 @@ import (
 )
 
 const (
-	providerWriteQueueSize      = 128
-	providerControlQueueSize    = 64
+	providerWriteQueueSize = 128
+	// providerControlQueueSize bounds the priority lane. Its frames are tiny
+	// (cancel / challenge / status, ~100 B) so the cost of depth is nil, while a
+	// full lane silently drops a cancel — the one loss path on the coordinator
+	// side of cancel delivery (inference.cancel_send_failed{reason:queue_full}).
+	providerControlQueueSize    = 256
 	providerWriteMinTimeout     = 5 * time.Second
 	providerWriteMaxTimeout     = 30 * time.Second
 	providerWriteBytesPerSecond = 2 << 20 // 2 MiB/s (~16 Mbps) floor.
@@ -31,6 +35,13 @@ const (
 var errProviderWriterStopped = errors.New(providerWriteDrainErrorString)
 var errProviderWriterQueueFull = errors.New("provider websocket writer queue full")
 var errProviderWriteTimeout = errors.New("provider websocket write timeout")
+
+// Exported forms of the writer's sentinel errors so callers can classify a
+// best-effort control-frame failure (cancel delivery metrics) with errors.Is.
+var (
+	ErrProviderWriterQueueFull = errProviderWriterQueueFull
+	ErrProviderWriterStopped   = errProviderWriterStopped
+)
 
 // TextFrameWriteMetadata describes the writer-owned handoff of a deferred
 // frame. The caller receives it synchronously and remains the sole owner of any

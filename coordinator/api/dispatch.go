@@ -2095,7 +2095,7 @@ func (d *dispatchState) waitFirstChunk() (outcome dispatchOutcome) {
 				select {
 				case errMsg := <-pr.ErrorCh:
 					d.excludeProviders[provider.ID] = struct{}{}
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatchAfterTerminal(provider, pr)
 					d.setLastInferenceError(provider, errMsg)
 					d.lastFailedVersion = failedProviderVersion(provider)
 					d.noteDispatchRetry(provider, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason, errMsg.TerminalCause, &d.heldChunks)
@@ -2122,7 +2122,7 @@ func (d *dispatchState) waitFirstChunk() (outcome dispatchOutcome) {
 				return outcomeCommitted
 			}
 			d.excludeProviders[provider.ID] = struct{}{}
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatchAfterTerminal(provider, pr)
 			d.setLastInferenceError(provider, errMsg)
 			d.lastFailedVersion = failedProviderVersion(provider)
 			s.logger.Warn("provider failed, retrying",
@@ -2234,7 +2234,7 @@ func (d *dispatchState) waitFirstChunk() (outcome dispatchOutcome) {
 		case <-r.Context().Done():
 			speculativeTimer.Stop()
 			deadlineTimer.Stop()
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatch(provider, pr, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -2432,7 +2432,7 @@ func (d *dispatchState) waitNoBackup() dispatchOutcome {
 				select {
 				case errMsg := <-pr.ErrorCh:
 					d.excludeProviders[provider.ID] = struct{}{}
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatchAfterTerminal(provider, pr)
 					d.setLastInferenceError(provider, errMsg)
 					d.lastFailedVersion = failedProviderVersion(provider)
 					d.noteDispatchRetry(provider, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason, errMsg.TerminalCause, &d.heldChunks)
@@ -2452,7 +2452,7 @@ func (d *dispatchState) waitNoBackup() dispatchOutcome {
 				return outcomeCommitted
 			}
 			d.excludeProviders[provider.ID] = struct{}{}
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatchAfterTerminal(provider, pr)
 			d.setLastInferenceError(provider, errMsg)
 			d.lastFailedVersion = failedProviderVersion(provider)
 			if s.metrics != nil {
@@ -2508,7 +2508,7 @@ func (d *dispatchState) waitNoBackup() dispatchOutcome {
 			return outcomeRetry
 		case <-r.Context().Done():
 			remainingDeadline.Stop()
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatch(provider, pr, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -2530,7 +2530,7 @@ func (d *dispatchState) awaitPrimaryEmptyCompletion(
 	backupPR *registry.PendingRequest,
 ) dispatchOutcome {
 	d.pr.ResolveSpeculativeEmptyCompletion(true)
-	d.s.cancelDispatch(backupProvider, backupPR)
+	d.s.cancelDispatch(backupProvider, backupPR, cancelCauseHedgeLoser)
 	d.markSpeculativeLoser(backupPR)
 	return d.waitAccepted()
 }
@@ -2543,7 +2543,7 @@ func (d *dispatchState) awaitBackupEmptyCompletion(
 	backupHeld []string,
 ) dispatchOutcome {
 	backupPR.ResolveSpeculativeEmptyCompletion(true)
-	d.s.cancelDispatch(primaryProvider, primaryPR)
+	d.s.cancelDispatch(primaryProvider, primaryPR, cancelCauseHedgeLoser)
 	d.s.ddIncr("inference.speculative_win", []string{"model:" + d.model})
 	d.s.registry.RecordWarmPoolSpeculativeWon(d.model)
 	d.markSpeculativeLoser(primaryPR)
@@ -2613,7 +2613,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 			}
 			// Primary wins!
 			raceDeadline.Stop()
-			s.cancelDispatch(backupProvider, backupPR)
+			s.cancelDispatch(backupProvider, backupPR, cancelCauseHedgeLoser)
 			if ok {
 				d.markSpeculativeLoser(backupPR)
 				d.commitFirstContent(pr, chunk.Data)
@@ -2624,7 +2624,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 					// Primary failed but we already cancelled backup.
 					d.markSpeculativeLoser(backupPR)
 					d.excludeProviders[provider.ID] = struct{}{}
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatchAfterTerminal(provider, pr)
 					d.setLastInferenceError(provider, errMsg)
 					d.lastFailedVersion = failedProviderVersion(provider)
 					d.noteDispatchRetry(provider, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason, errMsg.TerminalCause, &d.heldChunks)
@@ -2662,7 +2662,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 			}
 			// Backup wins!
 			raceDeadline.Stop()
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatch(provider, pr, cancelCauseHedgeLoser)
 			s.ddIncr("inference.speculative_win", []string{"model:" + d.model})
 			s.registry.RecordWarmPoolSpeculativeWon(d.model)
 			if ok {
@@ -2693,7 +2693,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 					return d.raceBackupChunkClosedWaitPrimary(provider, pr)
 				default:
 					// Backup channel closed with no error — treat as committed.
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatch(provider, pr, cancelCauseHedgeLoser)
 					d.markSpeculativeLoser(pr)
 					backupPR.BackupWon = true
 					d.provider = backupProvider
@@ -2750,7 +2750,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 					return d.awaitBackupEmptyCompletion(
 						provider, pr, backupProvider, backupPR, backupHeld)
 				}
-				s.cancelDispatch(backupProvider, backupPR)
+				s.cancelDispatch(backupProvider, backupPR, cancelCauseHedgeLoser)
 				d.markSpeculativeLoser(backupPR)
 				d.commitFirstContent(pr, chunk.Data)
 				d.committed = true
@@ -2758,7 +2758,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 				return outcomeCommitted
 			}
 			d.excludeProviders[provider.ID] = struct{}{}
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatchAfterTerminal(provider, pr)
 			d.lastFailedVersion = failedProviderVersion(provider)
 			d.updateSpeculativeFailure(pr, errMsg)
 			d.noteProviderError(provider, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason, errMsg.TerminalCause, &d.heldChunks)
@@ -2778,7 +2778,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 				if emptyCompletionPrecedesChunk(pr, chunk) {
 					return d.awaitPrimaryEmptyCompletion(backupProvider, backupPR)
 				}
-				s.cancelDispatch(provider, pr)
+				s.cancelDispatch(provider, pr, cancelCauseHedgeLoser)
 				d.markSpeculativeLoser(pr)
 				backupPR.BackupWon = true
 				d.provider = backupProvider
@@ -2792,7 +2792,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 				return outcomeCommitted
 			}
 			d.excludeProviders[backupProvider.ID] = struct{}{}
-			s.cancelDispatch(backupProvider, backupPR)
+			s.cancelDispatchAfterTerminal(backupProvider, backupPR)
 			d.lastFailedVersion = failedProviderVersion(backupProvider)
 			d.updateSpeculativeFailure(backupPR, errMsg)
 			d.noteProviderError(backupProvider, backupPR, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason, errMsg.TerminalCause, &backupHeld)
@@ -2811,7 +2811,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 					return d.awaitBackupEmptyCompletion(
 						provider, pr, backupProvider, backupPR, backupHeld)
 				}
-				s.cancelDispatch(backupProvider, backupPR)
+				s.cancelDispatch(backupProvider, backupPR, cancelCauseHedgeLoser)
 				d.markSpeculativeLoser(backupPR)
 				d.commitFirstContent(pr, chunk.Data)
 				d.committed = true
@@ -2821,7 +2821,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 				if emptyCompletionPrecedesChunk(pr, chunk) {
 					return d.awaitPrimaryEmptyCompletion(backupProvider, backupPR)
 				}
-				s.cancelDispatch(provider, pr)
+				s.cancelDispatch(provider, pr, cancelCauseHedgeLoser)
 				s.ddIncr("inference.speculative_win", []string{"model:" + d.model})
 				s.registry.RecordWarmPoolSpeculativeWon(d.model)
 				d.markSpeculativeLoser(pr)
@@ -2903,8 +2903,8 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 		case <-r.Context().Done():
 			raceDeadline.Stop()
 			d.updateSpeculativeClientGone(backupPR)
-			s.cancelDispatch(provider, pr)
-			s.cancelDispatch(backupProvider, backupPR)
+			s.cancelDispatch(provider, pr, cancelCauseClientGonePre)
+			s.cancelDispatch(backupProvider, backupPR, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -2933,7 +2933,7 @@ func (d *dispatchState) raceBackupChunkClosedWaitPrimary(provider *registry.Prov
 				select {
 				case errMsg2 := <-pr.ErrorCh:
 					d.excludeProviders[provider.ID] = struct{}{}
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatchAfterTerminal(provider, pr)
 					d.setLastInferenceError(provider, errMsg2)
 					d.lastFailedVersion = failedProviderVersion(provider)
 					d.updateSpeculativeFailure(pr, errMsg2)
@@ -2959,7 +2959,7 @@ func (d *dispatchState) raceBackupChunkClosedWaitPrimary(provider *registry.Prov
 				return outcomeCommitted
 			}
 			d.excludeProviders[provider.ID] = struct{}{}
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatchAfterTerminal(provider, pr)
 			d.setLastInferenceError(provider, errMsg2)
 			d.lastFailedVersion = failedProviderVersion(provider)
 			d.updateSpeculativeFailure(pr, errMsg2)
@@ -3007,7 +3007,7 @@ func (d *dispatchState) raceBackupChunkClosedWaitPrimary(provider *registry.Prov
 		case <-r.Context().Done():
 			remainingPrimary.Stop()
 			d.updateSpeculativeClientGone(pr)
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatch(provider, pr, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -3050,7 +3050,7 @@ func (d *dispatchState) racePrimaryFailedWaitBackup(backupProvider *registry.Pro
 				select {
 				case errMsg2 := <-backupPR.ErrorCh:
 					d.excludeProviders[backupProvider.ID] = struct{}{}
-					s.cancelDispatch(backupProvider, backupPR)
+					s.cancelDispatchAfterTerminal(backupProvider, backupPR)
 					d.setLastInferenceError(backupProvider, errMsg2)
 					d.lastFailedVersion = failedProviderVersion(backupProvider)
 					d.updateSpeculativeFailure(backupPR, errMsg2)
@@ -3085,7 +3085,7 @@ func (d *dispatchState) racePrimaryFailedWaitBackup(backupProvider *registry.Pro
 				return outcomeCommitted
 			}
 			d.excludeProviders[backupProvider.ID] = struct{}{}
-			s.cancelDispatch(backupProvider, backupPR)
+			s.cancelDispatchAfterTerminal(backupProvider, backupPR)
 			d.setLastInferenceError(backupProvider, errMsg2)
 			d.lastFailedVersion = failedProviderVersion(backupProvider)
 			d.updateSpeculativeFailure(backupPR, errMsg2)
@@ -3139,7 +3139,7 @@ func (d *dispatchState) racePrimaryFailedWaitBackup(backupProvider *registry.Pro
 		case <-r.Context().Done():
 			backupDeadline.Stop()
 			d.updateSpeculativeClientGone(backupPR)
-			s.cancelDispatch(backupProvider, backupPR)
+			s.cancelDispatch(backupProvider, backupPR, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -3167,7 +3167,7 @@ func (d *dispatchState) raceBackupErrWaitPrimary(provider *registry.Provider, pr
 				select {
 				case errMsg2 := <-pr.ErrorCh:
 					d.excludeProviders[provider.ID] = struct{}{}
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatchAfterTerminal(provider, pr)
 					d.setLastInferenceError(provider, errMsg2)
 					d.lastFailedVersion = failedProviderVersion(provider)
 					d.noteDispatchRetry(provider, pr, errMsg2.StatusCode, errMsg2.Error, errMsg2.ErrorReason, errMsg2.TerminalCause, &d.heldChunks)
@@ -3187,7 +3187,7 @@ func (d *dispatchState) raceBackupErrWaitPrimary(provider *registry.Provider, pr
 				return outcomeCommitted
 			}
 			d.excludeProviders[provider.ID] = struct{}{}
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatchAfterTerminal(provider, pr)
 			d.setLastInferenceError(provider, errMsg2)
 			d.lastFailedVersion = failedProviderVersion(provider)
 			d.updateSpeculativeFailure(pr, errMsg2)
@@ -3232,7 +3232,7 @@ func (d *dispatchState) raceBackupErrWaitPrimary(provider *registry.Provider, pr
 		case <-r.Context().Done():
 			primaryDeadline.Stop()
 			d.updateSpeculativeClientGone(pr)
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatch(provider, pr, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -3303,7 +3303,7 @@ func (d *dispatchState) waitAccepted() (outcome dispatchOutcome) {
 				select {
 				case errMsg := <-pr.ErrorCh:
 					d.excludeProviders[provider.ID] = struct{}{}
-					s.cancelDispatch(provider, pr)
+					s.cancelDispatchAfterTerminal(provider, pr)
 					d.setLastInferenceError(provider, errMsg)
 					d.lastFailedVersion = failedProviderVersion(provider)
 					s.logger.Warn("provider failed after accepting request, retrying",
@@ -3338,7 +3338,7 @@ func (d *dispatchState) waitAccepted() (outcome dispatchOutcome) {
 				return outcomeCommitted
 			}
 			d.excludeProviders[provider.ID] = struct{}{}
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatchAfterTerminal(provider, pr)
 			d.setLastInferenceError(provider, errMsg)
 			d.lastFailedVersion = failedProviderVersion(provider)
 			s.logger.Warn("provider failed after accepting request, retrying",
@@ -3410,7 +3410,7 @@ func (d *dispatchState) waitAccepted() (outcome dispatchOutcome) {
 			d.pr = nil
 			return outcomeRetry
 		case <-r.Context().Done():
-			s.cancelDispatch(provider, pr)
+			s.cancelDispatch(provider, pr, cancelCauseClientGonePre)
 			d.refundReservation()
 			return outcomeClientGone
 		}
@@ -3784,18 +3784,32 @@ func (d *dispatchState) writeCommittedResponse() {
 	snapshotChatCompletionMetadata(pr, info)
 
 	// On return (disconnect/timeout/completion): free the slot, tell the
-	// provider to stop, and preserve billing for a mid-stream disconnect.
+	// provider to stop if it may still be generating, and preserve billing for
+	// a mid-stream disconnect.
 	// Park BEFORE RemovePending so a racing provider terminal always finds the
 	// record in pending or the holder — never neither (which would drop it and
 	// mis-refund). GetPending is nil if a terminal already settled it (normal
 	// completion), so nothing is parked then. Both settle paths are
 	// FinalizeReservation-guarded, so the park-then-remove overlap can't double-bill.
+	//
+	// The cancel is sent only when a pending record still existed — no terminal
+	// seen, so the provider may still be running (consumer gone mid-stream, idle
+	// stream timeout). After a clean completion or a provider error terminal the
+	// record is already gone and a cancel would only cost the provider a no-op
+	// frame per request (~one per dispatch fleet-wide before this rule).
 	defer func() {
+		abandoned := false
+		cause := cancelCauseStreamTimeout
+		if r.Context().Err() != nil {
+			cause = cancelCauseClientGonePost
+		}
 		if stale := provider.GetPending(requestID); stale != nil {
-			// The provider is still generating for a client that is gone: this
-			// cancel is the one that stops real work, so stamp it.
-			stale.Profile.Mark(registry.StampCancelSent)
+			// Record the abandon BEFORE parking so a terminal racing this
+			// defer is correlated with the cancel rather than logged as unknown.
+			_, expired := s.zombieCanceller.record(requestID, pr.Model, cause, time.Now())
+			s.emitExpiredCancelEntries(expired)
 			s.holdForSettlement(stale)
+			abandoned = true
 		} else {
 			// A terminal already claimed the pending. In every normal path the
 			// reservation is finalized by now (completion billed it, the relay
@@ -3810,9 +3824,22 @@ func (d *dispatchState) writeCommittedResponse() {
 				s.refundReservedBalance(refundPr, "post_terminal_sweep:"+requestID)
 			})
 		}
-		provider.RemovePending(requestID) // then remove so SetProviderIdle frees the slot
+		removed := provider.RemovePending(requestID) // then remove so SetProviderIdle frees the slot
 		s.registry.SetProviderIdle(provider.ID)
-		s.sendProviderCancel(provider, requestID)
+		if !abandoned {
+			return
+		}
+		if removed == nil {
+			// A terminal claimed the record between GetPending and
+			// RemovePending: it settles via the parked copy and nothing is
+			// running provider-side.
+			s.zombieCanceller.forget(requestID)
+			return
+		}
+		// The provider is still generating for a client that is gone: this
+		// cancel is the one that stops real work, so stamp it.
+		pr.Profile.Mark(registry.StampCancelSent)
+		s.sendRecordedCancel(provider, requestID, pr.Model, cause, time.Now())
 	}()
 
 	// The committed provider's held preamble chunks stream out first, in
