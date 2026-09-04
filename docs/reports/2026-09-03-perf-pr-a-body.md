@@ -1,9 +1,13 @@
 # PR body — coordinator performance program, PR A: `store/` + `api/` (2026-09-03)
 
-> Last updated: 2026-09-03 · commit `25f842d63`
+> Last updated: 2026-09-04 · commit `bda995368`
 
 _Branch `perf/coordinator-store-api-2026-09-03`. Merge after
 `perf/coordinator-tier1-2026-09-03`; before `perf/coordinator-registry-scan-2026-09-03`._
+
+The measurements retain their original 2026-09-03 context. Shutdown and relay
+instrumentation notes were corrected during review on 2026-09-04 against
+`bda995368`.
 
 ## Summary
 
@@ -64,7 +68,7 @@ flowchart LR
     ST2["store.CachedStore (NewCached, wraps both backends)"] --> Q2["TTL + generation-checked domains; store.As[T] for backend-only capabilities"]
     ST2 --> CR2["Credit / CreditWithdrawable: one CTE (postgres.go)"]
     T2["telemetrySink (typed ops, coalescing worker)"] --> U2["RecordInferenceRoutes + UpdateInferenceRouteOutcomes (pgx batch)"]
-    V2["chatStreamRelay.handleChunk + finishStream + drainQueuedChunks"] --> W2["flush returns (frames, bytes, err) → relayStamps.wroteFrames"]
+    V2["chatStreamRelay.handleChunk + finishStream + drainQueuedChunks"] --> W2["flush writes batch → relayStamps.wroteFrames records frames, bytes and error"]
     P2["preprocessInferenceRequest: parsed map + dirty flag"] --> X2["toolschema_parsed, request_introspection fused walk, json_encoded_len, provider_body_memo/splice/seal"]
     N2["sse_normalize_gate: one pass"]
   end
@@ -93,9 +97,9 @@ added removed. Conflicts and the semantic hazards from
 
 | Where | Master side | Resolution |
 |---|---|---|
-| `api/consumer.go` (3 hunks), `api/generic_endpoint_stream.go` (1 hunk) | #809 `rs.wrote(n, werr)` after every client write, `rs.done()` after the terminal `[DONE]`, `profileClientGone(pr, phaseAfterCommit)` on every `Context().Done()` arm; #799 `writeChatStreamProviderError` + in-band `ErrorCh` select | perf's `chatStreamRelay` + `finishStream()` structure kept. `chatStreamRelay.flush` now returns `(frames, bytes, err)` and the new `relayStamps.wroteFrames` records them, so `chunks_out` keeps meaning SSE frames delivered (not flushes), `bytes_out` counts only accepted bytes, and a failed/short write sets `client_write_err`. `rs.done()` runs once after the terminal flush on the non-Responses success path (as on master). `profileClientGone` is on every relay `Context().Done()` arm including the generic relay's `finishStream`. #799's error writer, in-band select, `maxFirstChunkTimeoutRetries`, `errRoutingScanSaturated`, `errClientGoneBeforeScan` and the `dispatchOneProvider`/`dispatchWithReserver` arities are master's. `TestStreamRelay_ChatBurstByteIdentical` now also reads back the persisted request profile: `chunks_out` = 53 frames (a flush-count implementation would read ~9), `bytes_out` = the golden's length, `done_flushed_us` stamped, `client_write_err` false. |
+| `api/consumer.go` (3 hunks), `api/generic_endpoint_stream.go` (1 hunk) | #809 `rs.wrote(n, werr)` after every client write, `rs.done()` after the terminal `[DONE]`, `profileClientGone(pr, phaseAfterCommit)` on every `Context().Done()` arm; #799 `writeChatStreamProviderError` + in-band `ErrorCh` select | perf's `chatStreamRelay` + `finishStream()` structure kept. `chatStreamRelay.flush` writes the batch and calls `relayStamps.wroteFrames` with its frame count, accepted bytes, and write error, so `chunks_out` keeps meaning SSE frames delivered (not flushes), `bytes_out` counts only accepted bytes, and a failed/short write sets `client_write_err`. `rs.done()` runs once after the terminal flush on the non-Responses success path (as on master). `profileClientGone` is on every relay `Context().Done()` arm including the generic relay's `finishStream`. #799's error writer, in-band select, `maxFirstChunkTimeoutRetries`, `errRoutingScanSaturated`, `errClientGoneBeforeScan` and the `dispatchOneProvider`/`dispatchWithReserver` arities are master's. `TestStreamRelay_ChatBurstByteIdentical` now also reads back the persisted request profile: `chunks_out` = 53 frames (a flush-count implementation would read ~9), `bytes_out` = the golden's length, `done_flushed_us` stamped, `client_write_err` false. |
 | H7 — six #809 `store.Store` methods | `RecordRequestProfiles`, `RequestProfilesSince[Filtered]`, `RecordFleetSnapshots`, `FleetSnapshotsSince`, `PruneTelemetry` | `CachedStore` embeds `Store` and overrides none of them; `TestCachedStoreForwardsProfilerMethods` writes through the wrapper and reads back from the inner store. `profiler_sink.go` is its own goroutine, so the route sink's post-close rejection cannot drop profile writes. |
-| H9 — two flush-on-Close sinks | #809 `profileSink` | `Server.Close` runs `routeTelemetry.closeAndWait(2 s)` then `profiler.close()`; `main.go` registers `defer pgStore.Close()` before `defer srv.Close()`, so both flush before the pool closes. |
+| H9 — independent sink shutdown | #809 `profileSink` | `Server.Close` waits up to 2 s for `routeTelemetry.closeAndWait`, then signals `profiler.close()`. The route sink gets a bounded drain-and-wait; the profile sink is best-effort, with no queue drain or worker wait guaranteed. Although `main.go` defers pool closure until after `Server.Close`, queued profile records can still be discarded or outlive that closure. |
 | H10 — `api/profiler_sink.go` calls `isPowerOfTen` | perf's sink rewrite deleted it (kept `crossesPowerOfTen(before, after)`) | one call site switched to `crossesPowerOfTen(n-1, n)`: identical throttle (fires at 1, 10, 100, …), no duplicated helper. The walk now stops at 10^18 (`p > 0` guard) instead of overflowing near `math.MaxInt64`; cases added to `TestCrossesPowerOfTen`. |
 | H11 — `store/memory.go` `strconv` | #809 kept one `strconv.Itoa` use; perf dropped the import | import restored. |
 | `api/server.go`, `cmd/coordinator/main.go` | #816 rewrote the runtime manifest loading in both | auto-merged; perf's hunks (bounded sink flush in `Close`, catalog-cache invalidation, `emitStoreCacheGauges`, `store.NewCached` wiring) do not overlap. |
@@ -104,8 +108,12 @@ added removed. Conflicts and the semantic hazards from
 Profiler semantics note (for the system-profiler docs): the held finish/usage
 frames now count in `chunks_out` and `bytes_out` (master's #809 wrote them
 without an `rs.wrote`, stamping only the extras and `[DONE]` frames — an
-undercount this fixes), and `first_flush_us` / `max_chunk_gap_us` are stamped
-per flush — which is when the bytes reach the wire.
+undercount this fixes). For the chat relay, `first_flush_us` /
+`max_chunk_gap_us` are stamped per actual flush. Responses, completions, and
+messages emitters call `relayStamps.wrote` for each event write while using
+`deferredFlusher`; their timestamps precede the outer relay's coalesced flush
+and describe event-write timing, not wire-flush timing. See
+`relayStamps.flushedFrames` in `coordinator/api/profiler_dispatch.go`.
 
 ## Measurements
 
