@@ -447,11 +447,15 @@ func (r *Registry) ReserveNextFromPlan(pr *PendingRequest, plan *DispatchPlan, e
 			skip(PlanSkipGateRejected)
 			return nil, RoutingDecision{}, false
 		}
+		// Half-open capacity probe: check-and-claim under gate.mu, identical to
+		// the primary reservation path (p.mu → gate.mu).
+		if !r.gateOf(p).tryClaimCapacityProbe(model, now) {
+			p.mu.Unlock()
+			skip(PlanSkipGateRejected)
+			return nil, RoutingDecision{}, false
+		}
 		pr.ProviderID = p.ID
 		p.addPendingLocked(pr)
-		// Half-open capacity probe claim: identical to the primary reservation
-		// path (the r.mu write lock held across this loop serializes claims).
-		r.claimCapacityProbeLocked(p.ID, model, now)
 		if p.Status != StatusUntrusted && p.Status != StatusOffline {
 			p.Status = StatusServing
 		}
