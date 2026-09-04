@@ -29,6 +29,7 @@ func (s *Server) handleListModelsOpenRouter(w http.ResponseWriter, r *http.Reque
 		writeCachedJSON(w, body)
 		return
 	}
+	generation := s.readCacheGeneration()
 	data, err := s.openRouterFeedEntries()
 	if err != nil {
 		s.logger.Error("openrouter models: failed to list active models", "error", err)
@@ -40,15 +41,14 @@ func (s *Server) handleListModelsOpenRouter(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to encode models"))
 		return
 	}
-	s.readCacheSet(openRouterFeedCacheKey, body, openRouterFeedCacheTTL)
+	s.readCacheSetEntryIfCurrent(openRouterFeedCacheKey, ttlEntry{value: body}, openRouterFeedCacheTTL, generation)
 	writeCachedJSON(w, body)
 }
 
 // openRouterFeedCacheTTL bounds staleness of the marketplace feed. The feed is
 // catalog-driven (DB), with live providers contributing only datacenters and
-// non-text exclusions; admin alias/registry changes have no invalidation hook
-// into this key yet (SyncModelCatalog's invalidateCatalogCache in server.go
-// does not know it), so the window stays short.
+// non-text exclusions. Catalog sync invalidates the feed immediately and
+// rejects any stale publication from an in-flight pre-sync read.
 const openRouterFeedCacheTTL = 5 * time.Second
 
 const openRouterFeedCacheKey = "models:openrouter:v1"
