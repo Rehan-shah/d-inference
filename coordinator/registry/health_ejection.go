@@ -275,6 +275,12 @@ func (r *Registry) migrateFaultStateLocked(oldKey, newKey string) {
 		}
 		delete(r.identityVersions, oldKey)
 	}
+	if at, ok := r.identityVersionSeenAt[oldKey]; ok {
+		if cur, exists := r.identityVersionSeenAt[newKey]; !exists || at.After(cur) {
+			r.identityVersionSeenAt[newKey] = at
+		}
+		delete(r.identityVersionSeenAt, oldKey)
+	}
 	if at, ok := r.identityVersionResetAt[oldKey]; ok {
 		if cur, exists := r.identityVersionResetAt[newKey]; !exists || at.After(cur) {
 			r.identityVersionResetAt[newKey] = at
@@ -473,7 +479,9 @@ func (r *Registry) rememberDisconnectedStableIDLocked(sessionID, stableID string
 			}
 		}
 	}
-	r.disconnectedStableIDs[sessionID] = disconnectedStableID{id: stableID, at: time.Now()}
+	disconnectedAt := time.Now()
+	r.disconnectedStableIDs[sessionID] = disconnectedStableID{id: stableID, at: disconnectedAt}
+	r.touchIdentityVersionLocked(stableID, disconnectedAt)
 }
 
 // RecordProviderServeOutcome feeds one terminal outcome into the stable-identity

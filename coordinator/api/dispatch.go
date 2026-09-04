@@ -3872,7 +3872,7 @@ func (d *dispatchState) writeCommittedResponse() {
 		// The provider is still generating for a client that is gone: this
 		// cancel is the one that stops real work, so stamp it.
 		pr.Profile.Mark(registry.StampCancelSent)
-		s.sendRecordedCancel(provider, requestID, pr.Model, cause, time.Now())
+		s.sendRecordedCancel(provider, requestID, pr.Model, cause)
 	}()
 
 	// The committed provider's held preamble chunks stream out first, in

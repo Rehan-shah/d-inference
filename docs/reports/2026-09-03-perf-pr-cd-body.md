@@ -1,6 +1,6 @@
 # PR body — coordinator performance program, PR C/D: 2026-09-02 wave fixes (2026-09-03)
 
-> Last updated: 2026-09-04 · commit `aa87a0ebd`
+> Last updated: 2026-09-04 · commit `637cf48ea`
 
 Branch `perf/coordinator-wave-fixes-2026-09-03`.
 **Base: `perf/coordinator-tier2-base-2026-09-03` (PR A + PR B); retarget to master after PR #820 and PR #819 merge; Retry-After policy left for the owner.**
@@ -144,7 +144,7 @@ Per commit: `gofmt -l .`, `go build ./...`, `go vet ./...`, `golangci-lint v2.1.
 
 ## Notes for reviewers
 
-- Nothing under `store/`, `chat_stream_relay.go`, `stream_coalesce.go`, `generic_endpoint_stream.go`, `telemetry_sink.go`, `model_index.go`, `tps_registry.go` or `solo_tps.go` changes.
+- `store/interface.go` adds the transient, non-persisted `InferenceRouteOutcome.QueueExit` marker to keep queued exits out of dispatched-attempt metrics. No store schema or persistence behavior changes. Nothing under `chat_stream_relay.go`, `stream_coalesce.go`, `generic_endpoint_stream.go`, `telemetry_sink.go`, `model_index.go`, `tps_registry.go` or `solo_tps.go` changes.
 - The fault-tracker files Tier 3 is restructuring (`capacity_cooldown.go` untouched; `error_cooldown.go` +5, `health_ejection.go` +27/−3, `provider_breaker.go` +11/−1) carry behaviour-only hunks: a flush flag on the health-window outcome and the flush-strike tag on the inference-error strike.
 - Retry-After is deliberately untouched everywhere (#799's `estimateRetryAfter` / `estimateTTFTRetryAfter` stay).
 

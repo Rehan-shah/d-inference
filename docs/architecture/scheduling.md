@@ -443,6 +443,11 @@ identities follow identity enrichment without changing their original drop
 time, so a later weaker-identity reconnect cannot resurrect superseded faults
 (`coordinator/registry/version_reset.go`, `supersededDisconnectFlushLocked`;
 `coordinator/registry/health_ejection.go`, `migrateFaultStateLocked`).
+Version metadata for departed identities expires after
+`identityVersionRetention = 20 * time.Minute`; live identities, recent reset
+throttles, active fault windows and quarantines are retained. Disconnect
+starts a fresh reconnect grace window, and the eviction loop performs
+periodic cleanup (`coordinator/registry/version_history.go`).
 
 ## Invariants
 

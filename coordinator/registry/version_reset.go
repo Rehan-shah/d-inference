@@ -132,12 +132,14 @@ func (r *Registry) noteIdentityVersionLocked(stableID, version string) {
 	if r.identityVersions == nil {
 		r.identityVersions = make(map[string]string)
 	}
+	now := time.Now()
+	r.pruneIdentityVersionsLocked(now)
 	prev, seen := r.identityVersions[stableID]
 	r.identityVersions[stableID] = version
+	r.touchIdentityVersionLocked(stableID, now)
 	if !seen || prev == version {
 		return
 	}
-	now := time.Now()
 	if r.identityVersionResetAt == nil {
 		r.identityVersionResetAt = make(map[string]time.Time)
 	}

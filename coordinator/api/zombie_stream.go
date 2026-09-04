@@ -199,6 +199,31 @@ func (z *zombieStreamCanceller) markSent(requestID string, now time.Time) (resen
 	return e.markSent(now)
 }
 
+// send atomically records a successful enqueue before a terminal or sweep can
+// remove its entry. enqueue must only submit to the nonblocking provider control
+// queue; it must not wait for the frame to reach the network. Provider terminals
+// may arrive as soon as enqueue succeeds, so releasing mu between enqueue and
+// markSent would misclassify a delivered cancel as unsent.
+func (z *zombieStreamCanceller) send(requestID string, enqueue func() bool) (resendIndex int, sent bool) {
+	if z == nil {
+		return -1, enqueue()
+	}
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	e := z.entries[requestID]
+	if e == nil {
+		// The bounded tracker may have evicted the entry while the abandon
+		// path released capacity. Preserve its best-effort cancel even when
+		// terminal correlation is no longer available.
+		return -1, enqueue()
+	}
+	if !enqueue() {
+		e.nextResendAt = time.Now().Add(zombieResendRetry)
+		return -1, false
+	}
+	return e.markSent(time.Now()), true
+}
+
 // forget drops requestID: a terminal had already claimed the attempt, so no
 // cancel was sent and there is nothing to correlate.
 func (z *zombieStreamCanceller) forget(requestID string) {

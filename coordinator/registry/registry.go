@@ -2390,6 +2390,8 @@ type Registry struct {
 	// Disconnect.
 	identityVersions           map[string]string
 	identityVersionResetAt     map[string]time.Time
+	identityVersionSeenAt      map[string]time.Time
+	identityVersionSweepAt     time.Time
 	inferenceErrorFlushStrikes map[inferenceErrorKey][]time.Time
 
 	// evictStrikes counts consecutive eviction sweeps a provider has been stale.
@@ -6493,6 +6495,7 @@ func (r *Registry) StartEvictionLoop(ctx context.Context, timeout time.Duration)
 				return
 			case <-ticker.C:
 				r.evictStale(timeout)
+				r.sweepIdentityVersionHistory(time.Now())
 			}
 		}
 	})
