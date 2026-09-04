@@ -129,6 +129,15 @@ func TestResolveDominantExhaustedStatus_QueueDeadline(t *testing.T) {
 // off). Returns the server, store, registry and test server.
 func queuedFleetHarness(t *testing.T, ctx context.Context, cfg ServerConfig, model string) (*Server, *store.MemoryStore, *registry.Registry, *httptest.Server) {
 	t.Helper()
+	return queuedFleetHarnessConfigured(t, ctx, cfg, model, nil)
+}
+
+// queuedFleetHarnessConfigured is queuedFleetHarness with a hook that runs on
+// the server BEFORE the HTTP listener starts and any provider connects. Wiring
+// that provider goroutines read (the Datadog client, emitters) must go through
+// it: setting those fields after connectProvider races the heartbeat path.
+func queuedFleetHarnessConfigured(t *testing.T, ctx context.Context, cfg ServerConfig, model string, configure func(*Server)) (*Server, *store.MemoryStore, *registry.Registry, *httptest.Server) {
+	t.Helper()
 	t.Setenv(envQueueBeforeShed, "true")
 	t.Setenv(envColdDispatch, "false")
 	t.Setenv("EIGENINFERENCE_SERVABILITY_GATE", "false")
@@ -138,6 +147,9 @@ func queuedFleetHarness(t *testing.T, ctx context.Context, cfg ServerConfig, mod
 	reg := registry.New(logger)
 	srv := NewServer(reg, st, cfg, logger)
 	srv.challengeInterval = time.Hour
+	if configure != nil {
+		configure(srv)
+	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

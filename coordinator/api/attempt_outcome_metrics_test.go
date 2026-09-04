@@ -632,12 +632,15 @@ func TestQueuedExit_LiveQueueDeadline_CountsOnQueueOutcome(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	const model = "queue-exit-live-model"
-	srv, _, _, ts := queuedFleetHarness(t, ctx, ServerConfig{FirstContentDeadlineBase: 400 * time.Millisecond}, model)
 	collector := newUDPCollector(t)
 	defer collector.Close()
 	dd := newTestDD(t, collector)
 	defer dd.Close()
-	srv.SetDatadog(dd)
+	// Install the client before any provider connects: heartbeat telemetry
+	// reads s.dd on the provider read loop, so setting it afterwards races.
+	srv, _, _, ts := queuedFleetHarnessConfigured(t, ctx, ServerConfig{FirstContentDeadlineBase: 400 * time.Millisecond}, model, func(s *Server) {
+		s.SetDatadog(dd)
+	})
 
 	res := chatRequestWithID(ctx, ts.URL, model, "queue-exit-live")
 	if res.err != nil {
