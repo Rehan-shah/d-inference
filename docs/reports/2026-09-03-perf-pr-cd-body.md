@@ -101,10 +101,10 @@ flowchart LR
 
 ## Protocol symmetry
 
-- `HeartbeatStatusDraining = "draining"` and `InferenceErrorReasonDraining = "draining"` are the Go side of wire strings the Swift provider already emits in `eb2f84bb3` (`ProviderStatus.draining` in `Protocol/Enums.swift`; `InferenceFailure(code: .capacity, statusCode: 503, errorReason: .draining)` in `Inference/InferenceFailure.swift`). Additive; legacy providers send neither.
+- `HeartbeatStatusDraining = "draining"` and `InferenceErrorReasonDraining = "draining"` are the Go side of wire strings the Swift provider emits from `bcafa19e0` on this branch (`ProviderStatus.draining` in `Protocol/Enums.swift`; `InferenceFailure(code: .capacity, statusCode: 503, errorReason: .draining)` in `Inference/InferenceFailure.swift`; a port of `eb2f84bb3` from the bridge-cse worktree branch, which is not an ancestor of this branch). Both markers ship in the same provider commit and no tagged release carries either — `v0.8.16` sends neither — so a provider that types the reason also reports the status. Additive; legacy providers send neither.
 - `CoordinatorCauseProviderRestart` / `InferenceErrorReasonProviderRestart` are coordinator-internal and never on the wire (the ingress sanitizer's allowlists do not emit them).
 - `DecodeProviderMessage` / `scanChunkFrame` change no wire type; `58d7792da` has no Swift side for it (its Swift companion `e5461b53d` is the think-probe fix). `TestScanChunkFrameSwiftShapeTakesFastPath` pins the Swift sorted-key wire order.
-- `provider-swift/` is untouched on this branch.
+- `provider-swift/` changes on this branch are the drain-awareness emitter (`bcafa19e0`: `ProviderStatus.draining` in the heartbeat while refusing new work, `error_reason: draining` on the drain rejection) and the heartbeat encode-failure fallback keeping the computed status.
 
 ## Measurements (this base, M-series laptop with other load)
 
@@ -128,6 +128,14 @@ Per commit: `gofmt -l .`, `go build ./...`, `go vet ./...`, `golangci-lint v2.1.
 - `ClassifyPeerClose(peerCloseStatus, false)` hardcodes `oomSuspected=false` at its only call site (same as the source; outcome-neutral since OOM and read_error both take the abrupt cause).
 - The candidate-scan drop path now takes `p.mu` once per dropped provider to read the draining mark (previously only when a capacity cooldown was active) — one uncontended lock per dropped candidate.
 - `queue_deadline` is a new value in the rejection-ledger `reason_code`, `inference_routes.error_class` and `routing.first_chunk_timeout_reclassified{reason}` vocabularies; dashboards keyed on `first_chunk_timeout` shift accordingly.
+
+### Addressed from the second review pass (in this PR)
+
+- Queue drain: one pass runs per model at a time (`registry/queue_drain_coalesce.go`). A trigger that lands while a pass holds popped waiters — heartbeat, `SetProviderIdle`, challenge recovery, disconnect — no longer scans an empty queue; it makes the running pass go around once more with fresh fleet state and empty dominance records, attributed to that trigger. Closes the interleaving where a mid-pass capacity change left dominance-skipped waiters requeued on a stale verdict until the next trigger. Pinned by `TestDrainTriggerMidPassRerunsHeldWaiters` through a nil-in-production `drainBeforePop` seam.
+- Drain mark ownership removed: a provider's idle/serving heartbeat clears a typed-rejection-set mark too. The typed reason and the heartbeat status ship in the same provider binary (released 0.8.16 sends neither), so no provider types the reason without reporting the status, while the rejection-first ordering is real (the drain announcement is a detached task, dropped while the session is not registered). An aborted update drain is back in routing on its next heartbeat instead of after the 150 s TTL, which stays as the heartbeat-loss fallback. `TestMarkDraining_ClearedByIdleHeartbeat_OrTTL`, `TestDrain_TypedRejectionClearedByIdleHeartbeat` (inverted from the previous round).
+- Version-reset throttle follows an identity rebind: `migrateFaultStateLocked` now moves `identityVersionResetAt` with `identityVersions` (later timestamp wins), so a `sekey:` → `serial:` rebind cannot hand the identity a second flush-strike reset inside the 10-minute interval. `TestVersionResetThrottle_FollowsIdentityRebind`, `TestMigrateFaultState_ResetTimestampKeepsLater`.
+- `provider_version` tag cardinality: `sanitizeVersionTag` canonicalises to release-shaped values — strict `MAJOR.MINOR.PATCH`, optional `-(alpha|beta|rc).N`, leading `v` dropped — with the empty string as `unknown` and everything else as `other` (the previous `invalid` bucket is gone). Covers `inference.unknown_frames` and the MLX cache histograms.
+- Swift heartbeat encode-failure fallback carries the computed status (`draining`/`serving`/`idle`) instead of a literal `idle`; `UpdateDrainAwarenessTests` forces the path with a NaN capacity payload.
 
 ## Notes for reviewers
 
