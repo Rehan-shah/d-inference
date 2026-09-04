@@ -4170,7 +4170,8 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	// If queue drain didn't satisfy all pending requests (no warm provider),
 	// check if a cold provider should swap models to serve queued demand —
 	// coalesced fleet-wide to one plan per modelSwapPlanInterval, since N
-	// heartbeats inside that window would each re-derive the same plan
+	// heartbeats inside that window would each re-derive the same plan; a
+	// heartbeat the window refuses arms one trailing plan for its end
 	// (model_swap_coalesce.go).
 	r.triggerModelSwapsFromHeartbeat(now)
 }

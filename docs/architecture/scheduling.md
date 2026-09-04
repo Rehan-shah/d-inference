@@ -1,6 +1,6 @@
 # Scheduling: queues, slots, capacity and the warm pool
 
-> Last updated: 2026-09-04 · commit `26b72d1d1`
+> Last updated: 2026-09-04 · commit `53292b56c`
 
 Scheduling is the coordinator's model of *how much work the fleet can take
 and where the weights are*: the per-model request queue, the per-slot state
@@ -238,8 +238,16 @@ model in rather than waiting out the queue. It has two entry points:
   which returns without planning while the queue is empty and otherwise
   admits at most one plan per `modelSwapPlanInterval` across all heartbeats
   (`modelSwapPlanGate`). The planner walks the fleet per queued model, so N
-  heartbeats inside the window would each re-derive the same plan; the
-  queue *drain* is per-heartbeat and is not coalesced.
+  heartbeats inside the window would each re-derive the same plan. A
+  heartbeat the window refuses is coalesced, not dropped: it arms one
+  trailing plan for the end of the window (`armTrailing`,
+  `trailingModelSwapPlan`), so a provider that heartbeat made loadable waits
+  at most `modelSwapPlanInterval` for the planner rather than for the next
+  heartbeat; the trailing plan claims the same gate, so the planner still
+  runs at most once per window. If a delayed timer finds that a heartbeat
+  opened a newer window, it rearms for that window to preserve any later
+  suppressed state change. The queue *drain* is per-heartbeat and is not
+  coalesced.
 - **Cold dispatch** ([`EIGENINFERENCE_COLD_DISPATCH`](../reference/configuration.md#routing-admission-and-ttft),
   `coordinator/api/cold_dispatch.go`) calls `TriggerModelSwaps` directly the
   moment a request is enqueued; that kick is immediate and not subject to
@@ -337,7 +345,8 @@ previous heartbeat when that gap is at most `maxUptimeCredit =
 2 * time.Minute`, releases satisfied budget clamps, drains the provider's
 model queues with `DrainTriggerHeartbeat`, and calls
 `triggerModelSwapsFromHeartbeat`, which runs the swap planner only when the
-queue is non-empty and at most once per `modelSwapPlanInterval` fleet-wide
+queue is non-empty and at most once per `modelSwapPlanInterval` fleet-wide,
+a heartbeat the window refuses arming one trailing plan for the window's end
 ([above](#model-slots-pending-loads-and-swaps)).
 
 The provider CLI heartbeats every
