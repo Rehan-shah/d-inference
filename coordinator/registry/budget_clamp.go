@@ -247,9 +247,22 @@ func (g *gateState) budgetClampActive(cfg budgetClampConfig, model string, heart
 }
 
 // budgetClamped resolves the session's gate; the scan uses the cached p.gate
-// directly (snapshotProviderIntoPLockedEx).
+// through budgetClampedFor.
 func (r *Registry) budgetClamped(providerID, modelID string, heartbeatAt time.Time, rawBudgetRemaining int64, budgetReported bool, now time.Time) bool {
 	return r.lookupGateForSession(providerID).budgetClampActive(r.budgetClampCfg, modelID, heartbeatAt, rawBudgetRemaining, budgetReported, now)
+}
+
+// budgetClampedFor is budgetClampActive on the connected provider's cached
+// gate, confirmed against p.gate (gateView) — the routing snapshot's admission
+// input (snapshotProviderIntoPLockedEx and the preflight), read under p.mu.
+func (r *Registry) budgetClampedFor(p *Provider, model string, heartbeatAt time.Time, rawBudgetRemaining int64, budgetReported bool, now time.Time) bool {
+	view := r.gateViewOf(p)
+	for {
+		clamped := view.g.budgetClampActive(r.budgetClampCfg, model, heartbeatAt, rawBudgetRemaining, budgetReported, now)
+		if !view.moved() {
+			return clamped
+		}
+	}
 }
 
 // providerBudgetSnapshot reads the pair's live budget snapshot — the heartbeat

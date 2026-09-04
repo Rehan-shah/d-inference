@@ -60,10 +60,12 @@ func (ref gateRef) currentLocked(g *gateState) bool {
 }
 
 // gateRelockMaxRetries bounds how many times lockGate re-resolves a gate that
-// went stale between the index lookup and the lock. One retry is the
-// expected maximum (a rebind or a sweep landed in the window); the bound only
-// guarantees termination under an adversarial schedule, where the recorder
-// falls back to the gate it holds — today's behaviour, no worse.
+// went stale between the index lookup and the lock, and how many times a
+// routing read re-reads a gate the session moved away from (gateView.moved).
+// One retry is the expected maximum (a rebind or a sweep landed in the
+// window); the bound only guarantees termination under an adversarial
+// schedule, where the recorder falls back to the gate it holds and the reader
+// to the last view it read — today's behaviour, no worse.
 const gateRelockMaxRetries = 4
 
 // lockGate acquires gate.mu for a recorder at the named site. It follows any

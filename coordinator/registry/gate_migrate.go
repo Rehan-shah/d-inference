@@ -6,6 +6,24 @@ import "time"
 // state between gates: the forward a migrated-away gate leaves behind
 // (resolve), the merge and reset policy, bindStableFaultKey and
 // migrateGateLocked. Design, lock order and file map: gate_state.go.
+//
+// Rebind semantics. Fault state is keyed by IDENTITY, and a rebind MOVES the
+// identity's accumulated state to the refined identity (session id → sekey:
+// on the first bind, sekey: → serial: on MDA enrichment); the source identity
+// is left with nothing — exactly what the map-keyed implementation did
+// (migrateFaultStateLocked deleted the old key's entries). When the source
+// gate is SHARED with another live session (the same machine connected twice:
+// one SE key, two sessions), that session's identity starts from nothing too:
+// the state was the machine's and now lives under the machine's better key,
+// where the sibling lands at its own enrichment. It is deliberately not
+// copied — mergeLocked does not deduplicate histories, so a copy would
+// double-count every fault (strike lists, health rings, consecutive-fault
+// streaks) the moment the sibling enriches to the same serial. The shared
+// source's reset is published (its atomics zeroed) so the sibling's readers
+// see the move at once; the routing readers confirm their view against
+// p.gate (gateView) so the rebinding session's own in-flight scan cannot
+// mistake the emptied source for its state, and the recorders re-validate
+// under gate.mu (lockGate) for the same reason.
 
 // resolve follows forwardTo to the gate that currently holds this identity's
 // state. Lock-free; one atomic load in the common (not migrated) case.
@@ -219,7 +237,11 @@ func (r *Registry) migrateGateLocked(p *Provider, src, dst *gateState, orphan bo
 		}
 		src.resetLocked()
 	} else {
-		// Still bound to other sessions: it starts from nothing, visibly.
+		// Still bound to other sessions: it starts from nothing, visibly
+		// (rebind semantics in the file header). Published AFTER the repoint
+		// above, which is what lets a routing reader confirm a view of the
+		// zeros against p.gate (gateView) and a lock-free flag check trust a
+		// cleared flag (refHasPairState).
 		src.resetLocked()
 		src.publishLocked()
 	}

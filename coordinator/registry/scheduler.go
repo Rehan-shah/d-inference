@@ -1722,57 +1722,14 @@ func (r *Registry) providerRoutingGateReasonLockedEx(p *Provider, model string, 
 	if ok, reason := r.providerServesRoutableModelReasonLocked(p, model, selfRouteOwner); !ok {
 		return false, reason
 	}
-	// Skip a provider-model pair cooling down after a dispatch-time load
-	// failure ("insufficient memory") — it would instant-503 again, burning a
-	// dispatch attempt.
-	// The identity's gate (gate_state.go): cached on the connected provider, so
-	// the five gate reads below are atomic loads for a provider with no fault
-	// state and one short gate.mu section per tracker that has state.
-	g := r.gateOf(p)
-	if g.dispatchLoadCooled(model, now) {
-		return false, GateDispatchLoadCooldown
-	}
-	// Skip a triple quarantined by the inference-error circuit breaker for THIS
-	// request shape: repeated provider-side (5xx) failures — e.g. a deterministic
-	// chat-template render crash on tool schemas — mean a retry here fails
-	// identically, so routing must fall to a different provider. Shape-keyed so a
-	// tool failure does not deroute clean text traffic. Cleared by
-	// RecordInferenceSuccess (same shape) or by TTL expiry.
-	if g.inferenceErrorCooled(model, traits.CooldownShape(), now) {
-		return false, GateErrorCooldown
-	}
-	// Skip a (provider, model) pair quarantined by the capacity-reject cooldown:
-	// it kept capacity-rejecting with ZERO interleaved accepts (the black-hole
-	// signature — e.g. a box whose engine misreports its token budget), so a
-	// dispatch here is a guaranteed bounce while its idle-looking heartbeats
-	// keep winning the cost scheduler. A busy box that is also SERVING never
-	// trips this (any accept resets the streak), and the pair is re-probed once
-	// its TTL expires. See capacity_cooldown.go.
-	if !ignoreCapacityCooldown && g.capacityCooled(model, now) {
-		return false, GateCapacityCooldown
-	}
-	// Skip a provider quarantined by the per-provider node-health breaker: a
-	// node returning GENUINE-FAULT errors (500/502/504 or a
-	// fault-shaped 503) for ~all of its requests is sick regardless of model or
-	// shape, so it is derouted fleet-wide. This catches the node that fault-503s
-	// every request — invisible to the shape-keyed inference-error breaker above
-	// (which skips 503 as a capacity signal). Honored on the normal routing
-	// path; the selectBestCandidateLockedFull fail-open pass sets
-	// ignoreProviderBreaker so a bad fleet-wide rollout can't deroute everyone.
-	nowNS := now.UnixNano()
-	if !ignoreProviderBreaker && g.breakerOpenAt(nowNS) {
-		return false, GateBreaker
-	}
-	// Skip a provider EJECTED by the stable-identity health breaker (health_ejection.go):
-	// a node whose serial/SE-key/account has collapsed to a near-total served-fault
-	// rate is derouted even across reconnects (the session breaker above is wiped on
-	// every disconnect, which the constantly-disconnecting zombies exploit). Same
-	// fail-open contract: skipped on the ignoreProviderBreaker rescan, and an
-	// un-attestable provider (empty stable id) is never ejected.
-	if !ignoreProviderBreaker && healthEjectionEnabled() {
-		if r.ejectionOpenFor(g, stableProviderIdentityLocked(p), nowNS) {
-			return false, GateEjection
-		}
+	// The identity's fault-tracker gates (gate_state.go): cached on the
+	// connected provider, so the five reads are atomic loads for a provider
+	// with no fault state and one short gate.mu section per tracker that has
+	// state — and confirmed against p.gate afterwards (gateView), so a rebind
+	// landing mid-read cannot hand the scan an emptied gate.
+	view := r.gateViewOf(p)
+	if ok, reason := r.gateStateReasonLocked(&view, model, traits, now, ignoreProviderBreaker, ignoreCapacityCooldown); !ok {
+		return false, reason
 	}
 	// Liveness/trust/privacy core. selfRouteOwner relaxes ONLY the hardware-trust
 	// floor (to TrustNone) and private-only admission for a caller's own
@@ -1791,6 +1748,67 @@ func (r *Registry) providerRoutingGateReasonLockedEx(p *Provider, model string, 
 		return false, GateTraitFloor
 	}
 	return true, GateReasonCount
+}
+
+// gateStateReasonLocked evaluates the five fault-tracker gates for the session
+// behind view against its identity's gate and returns the first closed one
+// (GateReasonCount when all pass), in the documented gate precedence. The
+// verdict is confirmed against p.gate (gateView.moved) and re-read from the
+// session's new gate when a rebind landed between the view's load and the
+// reads — the scan, the commit's admit re-check and the preflight all come
+// through here, so none of them can dispatch a session past a breaker or
+// cooldown that moved with it. Caller holds p.mu (for the identity read).
+func (r *Registry) gateStateReasonLocked(view *gateView, model string, traits RequestTraits, now time.Time, ignoreProviderBreaker, ignoreCapacityCooldown bool) (bool, GateReason) {
+	nowNS := now.UnixNano()
+	for {
+		g := view.g
+		reason := GateReasonCount
+		switch {
+		// Skip a provider-model pair cooling down after a dispatch-time load
+		// failure ("insufficient memory") — it would instant-503 again, burning a
+		// dispatch attempt.
+		case g.dispatchLoadCooled(model, now):
+			reason = GateDispatchLoadCooldown
+		// Skip a triple quarantined by the inference-error circuit breaker for THIS
+		// request shape: repeated provider-side (5xx) failures — e.g. a deterministic
+		// chat-template render crash on tool schemas — mean a retry here fails
+		// identically, so routing must fall to a different provider. Shape-keyed so a
+		// tool failure does not deroute clean text traffic. Cleared by
+		// RecordInferenceSuccess (same shape) or by TTL expiry.
+		case g.inferenceErrorCooled(model, traits.CooldownShape(), now):
+			reason = GateErrorCooldown
+		// Skip a (provider, model) pair quarantined by the capacity-reject cooldown:
+		// it kept capacity-rejecting with ZERO interleaved accepts (the black-hole
+		// signature — e.g. a box whose engine misreports its token budget), so a
+		// dispatch here is a guaranteed bounce while its idle-looking heartbeats
+		// keep winning the cost scheduler. A busy box that is also SERVING never
+		// trips this (any accept resets the streak), and the pair is re-probed once
+		// its TTL expires. See capacity_cooldown.go.
+		case !ignoreCapacityCooldown && g.capacityCooled(model, now):
+			reason = GateCapacityCooldown
+		// Skip a provider quarantined by the per-provider node-health breaker: a
+		// node returning GENUINE-FAULT errors (500/502/504 or a
+		// fault-shaped 503) for ~all of its requests is sick regardless of model or
+		// shape, so it is derouted fleet-wide. This catches the node that fault-503s
+		// every request — invisible to the shape-keyed inference-error breaker above
+		// (which skips 503 as a capacity signal). Honored on the normal routing
+		// path; the selectBestCandidateLockedFull fail-open pass sets
+		// ignoreProviderBreaker so a bad fleet-wide rollout can't deroute everyone.
+		case !ignoreProviderBreaker && g.breakerOpenAt(nowNS):
+			reason = GateBreaker
+		// Skip a provider EJECTED by the stable-identity health breaker (health_ejection.go):
+		// a node whose serial/SE-key/account has collapsed to a near-total served-fault
+		// rate is derouted even across reconnects (the session breaker above is wiped on
+		// every disconnect, which the constantly-disconnecting zombies exploit). Same
+		// fail-open contract: skipped on the ignoreProviderBreaker rescan, and an
+		// un-attestable provider (empty stable id) is never ejected.
+		case !ignoreProviderBreaker && healthEjectionEnabled() && r.ejectionOpenFor(g, stableProviderIdentityLocked(view.p), nowNS):
+			reason = GateEjection
+		}
+		if !view.moved() {
+			return reason == GateReasonCount, reason
+		}
+	}
 }
 
 // snapshotProviderIntoLockedEx builds a routing snapshot for p into
@@ -1914,9 +1932,10 @@ func (r *Registry) snapshotProviderIntoPLockedEx(dst *routingSnapshot, p *Provid
 	// (Heartbeat stamps both in one critical section), which is what the
 	// release-freshness check compares against the clamp time. p.mu and r.mu
 	// are both held here (see lock discipline above); the clamp read is one
-	// lock-free flag load unless the identity actually carries a clamp.
+	// lock-free flag load unless the identity actually carries a clamp, and is
+	// confirmed against p.gate like the gates above (gateView).
 	rawRemaining := snap.activeTokenBudgetMax - snap.activeTokenBudgetUsed - snap.queuedTokenBudget
-	snap.budgetClamped = r.gateOf(p).budgetClampActive(r.budgetClampCfg, model, p.LastHeartbeat, rawRemaining, snap.activeTokenBudgetMax > 0, now)
+	snap.budgetClamped = r.budgetClampedFor(p, model, p.LastHeartbeat, rawRemaining, snap.activeTokenBudgetMax > 0, now)
 
 	return true, GateReasonCount
 }
@@ -2286,7 +2305,7 @@ func (r *Registry) buildCandidateInto(c *routingCandidate, pr *PendingRequest, n
 	// proportionally to its windowed reject rate. A soft derater, never an
 	// ejection: the candidate stays in the pool, so a degraded-but-only fleet
 	// still serves, and the penalty decays as outcomes age out of the window.
-	capacityRateMs, capacityRejectRate := r.gateOf(snap.provider).capacityRatePenalty(r.capacityRateCfg, snap.model, now)
+	capacityRateMs, capacityRejectRate := r.capacityRatePenaltyFor(snap.provider, snap.model, now)
 	cost := statePenalty + queueMs + pendingMs + backlogMs + thisReqMs + healthMs + capacityRateMs
 
 	// Estimated time-to-first-token for this candidate. Used for the
@@ -2976,7 +2995,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 		// (including the budgetless-snapshot hold for reconnecting sessions)
 		// so the preflight cannot report capacity that routing then refuses.
 		rawRemaining := snap.activeTokenBudgetMax - snap.activeTokenBudgetUsed - snap.queuedTokenBudget
-		snap.budgetClamped = r.gateOf(p).budgetClampActive(r.budgetClampCfg, model, p.LastHeartbeat, rawRemaining, snap.activeTokenBudgetMax > 0, now)
+		snap.budgetClamped = r.budgetClampedFor(p, model, p.LastHeartbeat, rawRemaining, snap.activeTokenBudgetMax > 0, now)
 
 		p.mu.Unlock()
 

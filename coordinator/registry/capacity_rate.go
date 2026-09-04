@@ -191,9 +191,22 @@ func (g *gateState) capacityRatePenalty(cfg capacityRateConfig, model string, no
 }
 
 // capacityRatePenalty resolves the session's gate; the scan uses the cached
-// p.gate directly (buildCandidateInto).
+// p.gate through capacityRatePenaltyFor.
 func (r *Registry) capacityRatePenalty(providerID, modelID string, now time.Time) (penaltyMs, rate float64) {
 	return r.lookupGateForSession(providerID).capacityRatePenalty(r.capacityRateCfg, modelID, now)
+}
+
+// capacityRatePenaltyFor is capacityRatePenalty on the connected provider's
+// cached gate, confirmed against p.gate (gateView): the candidate's cost
+// input (buildCandidateInto).
+func (r *Registry) capacityRatePenaltyFor(p *Provider, model string, now time.Time) (penaltyMs, rate float64) {
+	view := r.gateViewOf(p)
+	for {
+		penaltyMs, rate = view.g.capacityRatePenalty(r.capacityRateCfg, model, now)
+		if !view.moved() {
+			return penaltyMs, rate
+		}
+	}
 }
 
 // CapacityRejectRate exposes the pair's windowed capacity-reject rate and

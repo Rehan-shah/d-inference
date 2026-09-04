@@ -44,7 +44,11 @@ import (
 // belongs to (not retired, still the session's cached gate) and otherwise
 // releases, re-resolves through the index and retries. Everything that can
 // invalidate a resolved gate — the forward, the retire flag, the session's
-// repoint — is therefore written while holding that gate's mu.
+// repoint — is therefore written while holding that gate's mu. The routing
+// READS have the same window one layer down: the scan loads p.gate and reads
+// it holding no lock a rebind respects, so it confirms every verdict against
+// p.gate afterwards and re-reads from the session's new gate when it moved
+// (gateView, gate_index.go).
 //
 // Sections under gate.mu must stay per identity and microseconds long.
 //
