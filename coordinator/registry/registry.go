@@ -2867,6 +2867,14 @@ func (r *Registry) providerCanRouteBuildLocked(p *Provider, buildID string, minT
 	) {
 		return false
 	}
+	// The session's current gate, read under p.mu — which the identity bind
+	// also holds (bindStableFaultKey) — so a rebind cannot repoint p.gate, or
+	// migrate the cooldown away from the gate read here, mid-check. Without
+	// that, a read of a shared source gate emptied by this session's own
+	// rebind would say "not cooled" and let an alias resolve to a Desired
+	// build whose only provider is cooled (the request then queues or 429s
+	// instead of taking the routable Previous build). No gateView
+	// confirmation is needed under p.mu.
 	if r.gateOf(p).dispatchLoadCooled(buildID, now) {
 		return false
 	}
