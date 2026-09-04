@@ -1,6 +1,6 @@
 # Scheduling: queues, slots, capacity and the warm pool
 
-> Last updated: 2026-09-04 · commit `8a25c680e`
+> Last updated: 2026-09-04 · commit `c54b40e18`
 
 Scheduling is the coordinator's model of *how much work the fleet can take
 and where the weights are*: the per-model request queue, the per-slot state
@@ -382,6 +382,10 @@ A provider whose heartbeat age exceeds the timeout earns a strike; at
 `evictStrikeThreshold = 2` consecutive strikes it is disconnected. A provider
 must therefore be silent past the timeout at two successive sweeps — at
 least ~120 s — before eviction, which rides out a single delayed heartbeat.
+The read scan retains each candidate's exact provider pointer. Before removal,
+`disconnectProvider` rechecks that pointer and the latest heartbeat under the
+registry and provider locks. A heartbeat that recovered after the scan, or a
+replacement session registered under the same ID, cancels the stale eviction.
 
 ### Provider writer: two lanes
 
@@ -469,7 +473,8 @@ periodic cleanup (`coordinator/registry/version_history.go`).
 7. **Warm-pool loads per tick are bounded** — `rampLoadsThisTick`,
    `MaxGlobalPendingLoads`.
 8. **A provider is evicted only after `evictStrikeThreshold` consecutive stale
-   sweeps** — `evictStale` ([above](#heartbeat-cadence-and-eviction)).
+   sweeps and a fresh identity/heartbeat recheck at removal** — `evictStale`,
+   `disconnectProvider` ([above](#heartbeat-cadence-and-eviction)).
 9. **Control frames never wait behind queued data frames** — lane priority
    in `providerWriter`.
 10. **Disconnect preserves stable-identity fault state** — `Disconnect`.
@@ -500,7 +505,7 @@ periodic cleanup (`coordinator/registry/version_history.go`).
 | Pending loads and swaps | `coordinator/registry/registry.go` — `pendingModelLoadTTL`, `TriggerModelSwaps`, `bestModelLoadProviderLocked`, `SendLoadModel`; `coordinator/registry/model_swap_coalesce.go` — `modelSwapPlanInterval`, `modelSwapPlanGate`, `triggerModelSwapsFromHeartbeat` |
 | Warm pool | `coordinator/registry/warm_pool_controller.go` — `tick`, `plan`, `hasDemandPressure`, `targetWarm`, `WarmPoolSnapshot`; `coordinator/registry/warm_pool_target.go` — `warmTarget`, `qualityConcurrency`, `estimateServiceTime`, `rampLoadsThisTick`; `coordinator/registry/warm_pool_state.go` — `warmPoolArrivalEWMAAlpha` |
 | Warm-pool and quality-cap configuration | `coordinator/registry/config.go` — `WarmPoolConfig`, `QualityCapConfig`, `ReadConfig` |
-| Eviction | `coordinator/registry/registry.go` — `StartEvictionLoop`, `evictStale`, `evictStrikeThreshold`; wired in `coordinator/cmd/coordinator/main.go` |
+| Eviction | `coordinator/registry/registry.go` — `StartEvictionLoop`, `evictStale`, `disconnectProvider`, `evictStrikeThreshold`; wired in `coordinator/cmd/coordinator/main.go` |
 | Provider writer | `coordinator/registry/provider_writer.go` — `providerWriter`, `providerWriteTimeout`, `watchWrites` |
 | Teardown | `coordinator/registry/registry.go` — `Disconnect` |
 | Cold dispatch and queue-before-shed flags | `coordinator/api/cold_dispatch.go` |
