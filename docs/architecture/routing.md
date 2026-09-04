@@ -1,6 +1,6 @@
 # Routing: how a request becomes a provider choice
 
-> Last updated: 2026-09-03 · commit `5d400cf75`
+> Last updated: 2026-09-04 · commit `9d2138db3`
 
 Routing is the part of the coordinator that, given one inference request and
 the live fleet, picks the provider that should run it. It filters the fleet
@@ -424,12 +424,92 @@ accept is gated (`capacity_cooldown`) for `defaultCapacityCooldownTTL =
 
 Fault state keys by the provider's stable identity when one is bound, so it
 survives disconnect and reconnect (`Disconnect`, `coordinator/registry/registry.go`).
+Every tracker in this table and in [gray-box capacity signals](#gray-box-capacity-signals)
+stores its state in one `gateState` per identity
+([below](#concurrency-scan-commit-and-fault-state-gates)).
 
 **Fail-open.** If the scan produced no winner, at least one provider was
 rejected only by the breaker or ejection, and there were no capacity or TTFT
 rejections, `shouldBypassBreakerFailOpen` re-runs the scan with
 `ignoreProviderBreaker` so a degraded-but-only fleet still serves rather than
 returning `no_provider`.
+
+### Concurrency: scan, commit and fault-state gates
+
+`Registry.mu` is a writer-preferring `sync.RWMutex`: a pending writer blocks
+every new reader and drains the active batch of fleet scans first. Nothing on
+the request path takes it for writing.
+
+| Lock | Guards | Request-path holders |
+|---|---|---|
+| `Registry.mu` (`sync.RWMutex`, `coordinator/registry/registry.go`) | The provider map, catalog, aliases and routing configuration. | The scan and the commit, for READING (`scanProviderReservation`, `commitLock`). Writers are `Register`, `Disconnect`, `evictStale`, the swap planner and the config setters. |
+| `Provider.mu` | One provider's heartbeat state, pending set, attestation and cached gate pointer (`Provider.gate`). | The scan per provider (`snapshotProviderIntoLockedEx`); the commit's whole decide-and-debit section; the identity bind (`bindStableFaultKey`). |
+| `Registry.gatesMu` (`sync.RWMutex`) | The gate index: fault key → `gateState`, session → `Provider` (`coordinator/registry/gate_index.go`). | Recorders for READING (session → gate resolution) and for the one insert a new identity needs (`ensureGateLocked`). Also written by `attachSessionGate`, `detachSessionGate`, `bindStableFaultKey` and `sweepGates`. |
+| `gateState.mu` | One identity's fault trackers (`coordinator/registry/gate_state.go`). | Recorders (`lockGate`), the commit's probe claim (`tryClaimCapacityProbe`), the per-model gate reads. Microseconds, per identity. |
+
+Lock order: `r.mu → p.mu → gatesMu → gate.mu`. `r.mu` or `p.mu` is never
+acquired while `gatesMu` or a `gate.mu` is held, and there is no walk-wide
+gates lock on the scan (`gate_state.go` header).
+
+**Two-phase reservation** (`coordinator/registry/scheduler.go`).
+`scanProviderReservation` walks the fleet under `r.mu.RLock`; concurrent
+requests scan together and no capacity is consumed. `commitProviderReservation`
+holds `r.mu` for reading — the provider identity, catalog and cache-routing
+configuration must be stable, not the fleet frozen — and does everything that
+decides the reservation inside ONE `p.mu` section on the winner: the fresh
+snapshot (`snapshotProviderIntoPLockedEx`), the cost rebuild, the "winner
+unchanged since scan" compare (a change re-scans so the cohort does not herd
+onto the formerly cheapest provider), the admit re-check
+(`providerCanAdmitLockedEx`), the half-open capacity-probe claim
+(`tryClaimCapacityProbe`, check-and-claim under `gate.mu`) and the pending
+debit (`addPendingLocked`). `ReserveNextFromPlan`
+(`coordinator/registry/dispatch_plan.go`) commits each plan entry the same
+way. `commitLock` (`coordinator/registry/gate_commit_mode.go`) selects the
+mode: `reserveCommitShared` as described, or `reserveCommitGlobal`, which
+takes `r.mu.Lock()` for the commit — the previous fleet-wide serialization,
+kept as the kill switch behind
+[`EIGENINFERENCE_RESERVE_COMMIT_MODE`](../reference/configuration.md#routing-admission-and-ttft).
+
+**Per-identity gates.** Each fault tracker's state lives in a `gateState`
+keyed by fault key (serial → SE key → account → session id) with its own
+mutex; a connected provider caches its gate in `Provider.gate` (an atomic
+pointer). Recorders (`RecordProviderOutcome`, `RecordProviderServeOutcome`,
+`RecordInferenceError`, `RecordInferenceSuccess`, `RecordCapacityReject`,
+`RecordCapacityAcceptOutcome`, `RecordDispatchLoadFailure`,
+`ClearDispatchLoadCooldown`) resolve the gate and take `gate.mu` through
+`lockGate` (`coordinator/registry/gate_lock.go`), never `r.mu`; `lockGate`
+re-validates under the lock that the gate is still the session's current one
+and not retired, and re-resolves otherwise. The scan reads the breaker and
+ejection verdicts from atomics (`breakerOpenAt`, `ejectedAt`) and takes
+`gate.mu` only for a provider whose flag word (`pairFlags`) says it holds
+per-model state, so a provider with no fault state costs a few atomic loads.
+
+**Identity rebinds** (`coordinator/registry/gate_migrate.go`). `bindStableFaultKey`
+runs at every (re-)attestation and at account linkage, under the session's
+`p.mu` and `gatesMu`. When the key changes it MOVES the identity's accumulated
+state to the refined identity (`migrateGateLocked`; merge policy
+`mergeLocked`: expiries and trip counts take the max, histories merge
+chronologically) and empties the source: an orphaned source is forwarded
+(`forwardTo`) so stale pointers land on the live state; a source still bound
+to a sibling session is reset and republished. Because the bind holds
+`p.mu`, a section that reads `p.gate` under `p.mu` — the scan's gate chain,
+the commit through its debit, the alias resolver's `providerCanRouteBuildLocked`
+— never sees the identity change underneath it. The one dispatch-deciding
+read made without `p.mu`, the candidate's capacity-rate penalty
+(`capacityRatePenaltyFor`), confirms its verdict against `p.gate` afterwards
+and re-reads on a move (`gateView`, `coordinator/registry/gate_index.go`); the
+other gate reads confirm the same way as defence in depth.
+
+**Sweep** (`coordinator/registry/gate_sweep.go`). `sweepGates` runs from the
+eviction loop: it prunes per-model entries that can no longer gate routing
+and drops a gate with no live session once it has been idle for
+`gateIdleGrace = 10 * time.Minute`, marking it `retired` under `gate.mu`
+before the index delete so a recorder holding a stale pointer re-resolves.
+Half-open trip memory of a live gate is never pruned.
+
+**Observability.** `registry.gate.wait_ms` (DogStatsD histogram tagged
+`site:`, via `SetGateWaitObserver`) records a recorder's `gate.mu`
+acquisition wait when it exceeds `gateWaitReportThreshold = time.Millisecond`.
 
 ### Reputation
 
@@ -531,7 +611,25 @@ must not run in parallel with other scheduler tests in the same process.
 9. **Exactly one attempt of a race commits; the other is cancelled** —
    `runRace` calls `cancelDispatch` on the loser before committing.
 10. **Fault memory survives reconnects** — `Disconnect` preserves breaker,
-    cooldown and ejection state keyed by stable identity.
+    cooldown and ejection state keyed by stable identity
+    (`detachSessionGate`, `coordinator/registry/gate_index.go`).
+11. **The admit re-check and the pending debit are atomic per provider, and
+    no request-path commit takes `r.mu` for writing** —
+    `commitProviderReservation` and `ReserveNextFromPlan` snapshot, compare,
+    admit (`providerCanAdmitLockedEx`), claim the probe
+    (`tryClaimCapacityProbe`) and debit (`addPendingLocked`) under one `p.mu`
+    hold; `commitLock` takes `r.mu` for reading unless the kill switch is set.
+12. **A dispatch decision never straddles an identity rebind** —
+    `bindStableFaultKey` runs under the session's `p.mu`, so a section that
+    read `p.gate` under `p.mu` acts on that same identity; a read made without
+    `p.mu` confirms against `p.gate` (`gateView.moved`).
+13. **Fault state moves with the identity and is never double-counted** —
+    `migrateGateLocked` merges the source into the destination (`mergeLocked`)
+    and empties the source; the state is not copied.
+14. **One capacity probe at a time per cooled (identity, model) pair** —
+    `tryClaimCapacityProbeLocked` is check-and-claim under `gate.mu`: a
+    second commit within `capacityProbeOutcomeWindow` of an outstanding claim
+    is rejected instead of leaking a second probe.
 
 ## Failure modes
 
@@ -553,6 +651,8 @@ must not run in parallel with other scheduler tests in the same process.
 | Shared gate primitives | `coordinator/registry/routing_eligibility.go` — `providerLivenessGateReasonLocked`, `providerServesRoutableModelLocked` |
 | Closed vocabularies | `coordinator/registry/gate_reason.go` — `GateReason`, `SelectionPath`, `SlotState` |
 | Trust floor, challenge failures, dispatch-load cooldown, `Disconnect` | `coordinator/registry/registry.go` — `MinTrustLevel`, `MaxFailedChallenges`, `RecordChallengeFailure`, `dispatchLoadCooldownTTL` |
+| Two-phase reservation (scan, commit, plan consumption) | `coordinator/registry/scheduler.go` — `scanProviderReservation`, `commitProviderReservation`, `providerCanAdmitLockedEx`; `coordinator/registry/dispatch_plan.go` — `ReserveNextFromPlan` |
+| Per-identity fault-state gates | `coordinator/registry/gate_state.go` — `gateState`, `publishLocked`, `breakerOpenAt`, `ejectedAt`; `coordinator/registry/gate_index.go` — `gateOf`, `gateView`, `attachSessionGate`, `detachSessionGate`; `coordinator/registry/gate_migrate.go` — `bindStableFaultKey`, `migrateGateLocked`, `mergeLocked`; `coordinator/registry/gate_lock.go` — `lockGate`, `gateRef`, `SetGateWaitObserver`; `coordinator/registry/gate_sweep.go` — `sweepGates`, `gateIdleGrace`; `coordinator/registry/gate_commit_mode.go` — `reserveCommitMode`, `commitLock` |
 | Bounded dispatch plan | `coordinator/registry/dispatch_plan.go` — `dispatchPlanMaxAlternates`, `PlanEntry` |
 | Servability predictor | `coordinator/registry/servability.go` — `PredictServable`, `coldTokenBudgetEstimate`, `servabilityActivationFloor` |
 | Budget clamp | `coordinator/registry/budget_clamp.go` — `recordBudgetClampLocked`, `releaseBudgetClampsOnHeartbeat` |

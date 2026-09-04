@@ -1,6 +1,6 @@
 # perf(registry): take the global write lock off the per-request path (Tier 3)
 
-> Last updated: 2026-09-04 · commit `bacbf95d0`
+> Last updated: 2026-09-04 · commit `6a1d1eb27`
 
 Stacks on `perf/coordinator-registry-scan-2026-09-03` (PR B: per-model index, arena snapshots,
 cached medians). **Merge after it and after PR #818** (`perf/coordinator-tier1-2026-09-03`, the
@@ -50,10 +50,11 @@ periodic per-gate sweep from the eviction loop. Identity rebinds migrate a gate'
 orphan, so a recorder holding a stale pointer still lands on the live state; and because a recorder
 resolves its gate under `gatesMu.RLock` but locks it only after letting go of `gatesMu`, it re-validates
 the gate under `gate.mu` once acquired (not retired by the sweep, still the session's cached gate) and
-re-resolves through the index otherwise. The routing READS have the same window one layer down — the scan
-loads `p.gate` and reads it holding no lock a rebind respects — so every read that feeds a dispatch decision
-confirms its verdict against `p.gate` afterwards and re-reads from the session's new gate when it moved
-(`gateView`; see "Review follow-ups").
+re-resolves through the index otherwise. The routing READS are covered two ways: the identity bind runs under the session's `p.mu`
+(third review pass), so the scan's gate chain, the commit through its debit and the alias resolver — all under
+`p.mu` — never see `p.gate` move mid-section; and every read that feeds a dispatch decision also confirms its
+verdict against `p.gate` afterwards and re-reads from the session's new gate when it moved (`gateView`; see
+"Review follow-ups"), which is what covers the candidate cost read the scan makes after releasing `p.mu`.
 
 **(a′) Commit without the global write lock.** `commitProviderReservation` and
 `ReserveNextFromPlan` hold `r.mu` for **reading** (identity, catalog and cache-routing config only)
@@ -133,7 +134,7 @@ flowchart TB
 | Probe claim atomic w.r.t. other commits | `gateState.tryClaimCapacityProbe`: check **and** claim in one `gate.mu` section, per identity; a closed gate rejects the reservation instead of leaking a second probe. Test: two sessions of one identity racing → exactly one claim. |
 | Fleet-wide serialization makes the "unchanged since scan" compare exact (herd avoidance) | The four-field compare runs against a snapshot taken under the **same `p.mu` hold that debits**; only the winner's own counters are compared, so `p.mu` suffices. A concurrent commit on the same provider is either fully before (visible → rescan) or fully after. |
 | Stale gate state seen by a scan | Already tolerated between scan RUnlock and commit; the commit re-checks under `p.mu`/`gate.mu`. A gate being migrated is read two ways. An ORPHANED source (its last session left) is forwarded before it is reset and never republished, so lock-free readers see its intact pre-merge view or the forward, never zeros. A SHARED source (a sibling session still bound to it) IS reset and republished — the state moved with the rebinding session — so every read that feeds a dispatch decision (the five routing gates in `gateStateReasonLocked`: scan, commit admit re-check and preflight; the snapshot's budget clamp on both snapshot paths; the candidate's capacity-rate penalty) confirms its verdict against `p.gate` after the read and re-reads from the session's new gate when it moved (`gateView`, bounded like `lockGate`'s re-resolve). Sound without a lock because the migration repoints `p.gate` BEFORE it resets and republishes the source, and Go's atomics are sequentially consistent. Tallies, classification counts, fleet_sample rows and warm-pool planning read unconfirmed: a stale sample there miscounts once and dispatches nothing. Test: a scan that loaded the shared gate before the rebind is gated on the new gate (breaker — atomic path — and dispatch-load cooldown — locked per-model path; both modes), an unconfirmed read of the stale gate says clean, the sibling's view reads not gated, and the end-to-end reservation never lands on the rebound session; a `-race` stress variant with a flapping session carrying a permanent cooldown. |
-| Identity rebind moves accumulated fault state | `bindStableFaultKey` migrates `gateState` → `gateState` under `gatesMu.Lock` (the only place two gate locks nest); stale pointers follow `forwardTo`; a recorder holding a stale pointer re-validates under `gate.mu` (not retired, still the session's cached gate) and re-resolves through the index otherwise; the session is repointed inside the migration's two-gate locked section, so a recorder holding the source either wrote before the merge (its outcome travels) or sees the pointer moved. A shared identity gate with other live sessions is emptied, not orphaned — the repointed `p.gate` is what tells a stale holder its outcome now belongs to the new gate. The lock-free "no per-model state" fast paths (probe claim, the clear recorders) trust a cleared flag only while `p.gate` still points at the gate it was read from (`refHasPairState`). **Semantics (written down in `gate_migrate.go`): the state MOVES, it is not copied.** The source identity — and a sibling session still bound to it (the same machine connected twice: one SE key, two sessions) — starts from nothing, exactly as the map-keyed `migrateFaultStateLocked` left the old key; the sibling lands on the moved state at its own enrichment. A copy was rejected: the merge does not deduplicate histories, so it would double-count every fault (strike lists, health rings, consecutive-fault streaks) the moment the sibling enriches to the same serial. |
+| Identity rebind moves accumulated fault state | `bindStableFaultKey` migrates `gateState` → `gateState` under the session's `p.mu` and `gatesMu.Lock` (the only place two gate locks nest); stale pointers follow `forwardTo`; a recorder holding a stale pointer re-validates under `gate.mu` (not retired, still the session's cached gate) and re-resolves through the index otherwise; the session is repointed inside the migration's two-gate locked section, so a recorder holding the source either wrote before the merge (its outcome travels) or sees the pointer moved. A shared identity gate with other live sessions is emptied, not orphaned — the repointed `p.gate` is what tells a stale holder its outcome now belongs to the new gate. The lock-free "no per-model state" fast paths (probe claim, the clear recorders) trust a cleared flag only while `p.gate` still points at the gate it was read from (`refHasPairState`). **Semantics (written down in `gate_migrate.go`): the state MOVES, it is not copied.** The source identity — and a sibling session still bound to it (the same machine connected twice: one SE key, two sessions) — starts from nothing, exactly as the map-keyed `migrateFaultStateLocked` left the old key; the sibling lands on the moved state at its own enrichment. A copy was rejected: the merge does not deduplicate histories, so it would double-count every fault (strike lists, health rings, consecutive-fault streaks) the moment the sibling enriches to the same serial. |
 | Fault state survives Disconnect; identity-less residue is dropped | `detachSessionGate`: caches the stable id for the trailing flush and keeps the identity's gate; a session-keyed gate (no identity) is dropped at Disconnect. |
 | Bounded maps | Periodic `sweepGates` from the eviction loop (plus a rate-limited inline sweep past 4096 gates): prunes dead per-model entries; drops gates with no live session once idle for 10 min, marking them `retired` under `gate.mu` before the index delete so a recorder that resolved the gate before the walk re-resolves instead of writing into it. A gate's **creation counts as activity** for the idle grace, so a gate filed for a disconnected identity (the trailing flush's first fault, a serve outcome by stable id) cannot be swept before the recorder that created it takes the lock — an untouched disconnected identity therefore lingers ≤ 10 min instead of dropping on the first sweep (negligible: one empty `gateState`). Half-open trip memory of a **live** gate is never pruned (the old size-triggered sweeps only ran past 1024 entries). |
 
@@ -226,6 +227,39 @@ only read-side touch left near a recorder is the budget snapshot for the clamp
 `p.mu` via the `sessions` index — no `r.mu` at all.
 
 ## Review follow-ups
+
+### Third pass
+
+Codex's third review left five findings; all legitimate.
+
+- **F1 [P1] — a landed report was edited.** The "Follow-on" cross-link added to the PR-B body (landed on
+  the parent branch; reports are frozen) is removed; the Tier 3 body is indexed in `docs/reports/README.md`
+  instead. Commit `6a64f71a8`.
+- **F2 [P1] — `EIGENINFERENCE_RESERVE_COMMIT_MODE` documented only here.** Row added to
+  `docs/reference/configuration.md` (values, default, read-once at construction, what each mode holds).
+  Commit `9d2138db3`.
+- **F3 [P2] — a rebind could land between the commit's final gate check and its debit.**
+  `bindStableFaultKey` ran after `SetAttestationResult` / `RebindStableFaultKey` had released `p.mu`, while
+  the commit reads `p.gate` (the admit re-check) and debits inside one `p.mu` section in both modes;
+  `gateView` closes a rebind that lands during the reads, not one after `moved()` has confirmed them, so a
+  commit could accept a clean source gate and dispatch to a session whose destination identity already
+  carried a breaker or cooldown. The map-keyed code had no window (bind and commit shared `r.mu.Lock`).
+  Both entry points now derive the identity and bind while `p.mu` is still held; lock order unchanged
+  (`r.mu → p.mu → gatesMu → gate.mu` — the bind takes the last two, and no recorder takes `p.mu` under a
+  gate lock). `gateView` stays for the capacity-rate read the scan makes after releasing `p.mu`. Test:
+  `p.gate` never changes under a `p.mu` holder while the session flaps identities through either entry
+  point (`-race`; 2000+ moves per run without the fix, zero with it). Commit `dd936c097`.
+- **F4 [P2] — the alias resolver's cooldown read was unconfirmed.** `providerCanRouteBuildLocked`
+  (`ResolveModel` → `anyProviderCanRouteBuildLocked`) read `gateOf(p).dispatchLoadCooled` with no
+  confirmation, so a shared source reset by this session's own rebind could read "not cooled" and resolve
+  the alias to a Desired build whose only provider was cooled. Closed by F3: the read runs under `p.mu`,
+  which the bind now holds; said so at the read site. Test: a Desired-only session flapping identities with
+  a travelling cooldown while every concurrent `ResolveModel` must pick Previous (`-race`; ~2400 wrong
+  resolutions per run without the fix, zero with it). Commit `d789d1723`.
+- **F5 [P1] — the locking model was documented only here.** `docs/architecture/routing.md` gains
+  "Concurrency: scan, commit and fault-state gates" (lock table and order, two-phase reservation, the
+  per-identity gates and recorders, rebinds, sweep, observability), four invariants and the code-map rows
+  for the `gate_*.go` files; `scheduling.md` carries the double-booking invariant with a link. This commit.
 
 ### Second pass
 

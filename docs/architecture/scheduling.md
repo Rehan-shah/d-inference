@@ -1,6 +1,6 @@
 # Scheduling: queues, slots, capacity and the warm pool
 
-> Last updated: 2026-09-04 · commit `26b72d1d1`
+> Last updated: 2026-09-04 · commit `9d2138db3`
 
 Scheduling is the coordinator's model of *how much work the fleet can take
 and where the weights are*: the per-model request queue, the per-slot state
@@ -427,6 +427,10 @@ keeps `StatusUntrusted` instead. Eviction reaches `Disconnect` directly. It:
 9. **Control frames never wait behind queued data frames** — lane priority
    in `providerWriter`.
 10. **Disconnect preserves stable-identity fault state** — `Disconnect`.
+11. **A provider is never double-booked** — the admit re-check and the
+    pending debit run under one `p.mu` hold in `commitProviderReservation`
+    and `ReserveNextFromPlan`; the locking model is in
+    [`routing.md`](routing.md#concurrency-scan-commit-and-fault-state-gates).
 
 ## Failure modes
 
