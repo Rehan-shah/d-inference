@@ -364,7 +364,9 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 		}
 
 		var msg protocol.ProviderMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
+		// DecodeProviderMessage is json.Unmarshal minus its redundant outer
+		// validation pass; per-token chunk frames take a hand-written decoder.
+		if err := protocol.DecodeProviderMessage(data, &msg); err != nil {
 			// Decoder errors may quote provider-controlled fields (notably an
 			// unknown message type). Never reflect the detail into logs.
 			s.logger.Warn("invalid provider message", "provider_id", providerID)
