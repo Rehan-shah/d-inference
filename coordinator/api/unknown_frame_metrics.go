@@ -26,9 +26,13 @@ const (
 	unknownFrameKindError    = "error"
 )
 
-// maxVersionTagLen bounds the provider_version tag: a real semver string is
-// short, and anything longer is treated as untrusted input.
+// maxVersionTagLen bounds the provider_version tag before parsing: a release
+// version is short, and anything longer is untrusted input.
 const maxVersionTagLen = 32
+
+// versionTagPrereleaseKinds are the prerelease identifiers a release version
+// can carry ("0.8.16-rc.1"). Any other prerelease shape is not a release.
+var versionTagPrereleaseKinds = map[string]bool{"alpha": true, "beta": true, "rc": true}
 
 // emitUnknownFrame counts one provider frame for an unknown request id.
 func (s *Server) emitUnknownFrame(kind string, provider *registry.Provider) {
@@ -58,24 +62,52 @@ func providerVersionTag(p *registry.Provider) string {
 	return sanitizeVersionTag(version)
 }
 
-// sanitizeVersionTag keeps a version string only when it is short and made of
-// the characters a release version can contain (digits, letters, '.', '-').
-// Everything else — including the empty string — is normalized so a
-// provider-controlled value can never mint tag cardinality.
+// sanitizeVersionTag canonicalises a provider-reported version to a bounded
+// tag vocabulary: a release version — strict MAJOR.MINOR.PATCH, optionally with
+// a known prerelease "-(alpha|beta|rc).N", leading "v" dropped — is kept as
+// its canonical string, the empty string is "unknown" (the provider reported
+// no version), and everything else is "other". The tag rides every MLX
+// heartbeat histogram and unknown-frame counter, so a provider-controlled
+// string that merely passed a character check could mint one Datadog series
+// per reconnect; only values a real release could carry get their own.
 func sanitizeVersionTag(version string) string {
 	version = strings.TrimSpace(version)
 	if version == "" {
 		return "unknown"
 	}
 	if len(version) > maxVersionTagLen {
-		return "invalid"
+		return "other"
 	}
-	for _, c := range version {
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '.', c == '-':
-		default:
-			return "invalid"
+	version = strings.TrimPrefix(version, "v")
+	core, pre, hasPre := strings.Cut(version, "-")
+	segs := strings.Split(core, ".")
+	if len(segs) != 3 {
+		return "other"
+	}
+	for _, seg := range segs {
+		if !versionTagNumeric(seg) {
+			return "other"
+		}
+	}
+	if hasPre {
+		kind, n, ok := strings.Cut(pre, ".")
+		if !ok || !versionTagPrereleaseKinds[kind] || !versionTagNumeric(n) {
+			return "other"
 		}
 	}
 	return version
+}
+
+// versionTagNumeric reports whether s is a semver numeric identifier: one or
+// more ASCII digits with no leading zero (or exactly "0").
+func versionTagNumeric(s string) bool {
+	if s == "" || (len(s) > 1 && s[0] == '0') {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
