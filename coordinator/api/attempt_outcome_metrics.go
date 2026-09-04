@@ -103,14 +103,17 @@ const (
 )
 
 // isCapacityClassErrorReason reports whether a persisted error_reason names a
-// capacity / admission condition (the provider is healthy but full, or the
-// request cannot fit) rather than a fault.
+// capacity / admission condition (the provider is healthy but full, the
+// request cannot fit, or the provider is draining ahead of a restart and
+// refusing new work — routing counts that as transient capacity too) rather
+// than a fault.
 func isCapacityClassErrorReason(reason string) bool {
 	switch normalizeInferenceErrorReason(reason) {
 	case errorReasonCapacityBusy, errorReasonCapacityTimeout, errorReasonQueueFull,
 		errorReasonTokenBudgetExhaust, errorReasonRequestExceedsContext,
 		errorReasonRequestExceedsNode, errorReasonRequestExceedsNodeBudget,
-		errorReasonRequestExceedsBatchBudget, errorReasonModelLoad:
+		errorReasonRequestExceedsBatchBudget, errorReasonModelLoad,
+		errorReasonDraining:
 		return true
 	default:
 		return false
