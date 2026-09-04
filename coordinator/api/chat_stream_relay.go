@@ -17,6 +17,13 @@ import (
 type chatStreamRelay struct {
 	pr *registry.PendingRequest
 
+	// w and flusher are the client sink every batch is written to, and stamps
+	// records each flush in the request profile. The relay owns them so that
+	// writeFrame can flush on its own when a batch reaches the byte cap.
+	w       http.ResponseWriter
+	flusher http.Flusher
+	stamps  *relayStamps
+
 	// sawResponsesAPI latches once a Responses API event is seen; from then on
 	// chat-completions-specific handling (DONE swallowing, usage/finish holds,
 	// normalizeSSEChunk, coordinator terminators) is skipped.
@@ -35,12 +42,14 @@ type chatStreamRelay struct {
 	// buf accumulates the frames of one batch (each already framed with its
 	// trailing blank line) until flush writes them in one call; frames counts
 	// them so the relay stamps can keep chunks_out in SSE frames, not flushes.
+	// The batch is bounded by maxCoalescedBatchBytes (see writeFrame), and
+	// flush releases a backing array that grew past that bound.
 	buf    bytes.Buffer
 	frames int
 }
 
-func newChatStreamRelay(pr *registry.PendingRequest) *chatStreamRelay {
-	return &chatStreamRelay{pr: pr}
+func newChatStreamRelay(pr *registry.PendingRequest, w http.ResponseWriter, flusher http.Flusher, stamps *relayStamps) *chatStreamRelay {
+	return &chatStreamRelay{pr: pr, w: w, flusher: flusher, stamps: stamps}
 }
 
 // handleChunk runs one provider chunk through the relay pipeline: Responses
@@ -87,28 +96,45 @@ func (rl *chatStreamRelay) handleChunk(chunk string) {
 }
 
 // writeFrame appends one SSE frame (a "data: ..." payload without its
-// trailing blank line) to the current batch.
+// trailing blank line) to the current batch. It is the only point at which
+// bytes enter buf, so the byte cap is enforced here and covers every drain
+// (the 32-chunk main-loop drain and the whole-channel drain ahead of a
+// provider error alike): when appending would push the batch past
+// maxCoalescedBatchBytes, the pending batch is flushed first. A single frame
+// larger than the cap is still written whole — the batch then holds exactly
+// that frame, the same peak the pre-coalescing per-chunk write had.
 func (rl *chatStreamRelay) writeFrame(frame string) {
+	if rl.buf.Len() > 0 && rl.buf.Len()+len(frame)+len("\n\n") > maxCoalescedBatchBytes {
+		rl.flush()
+	}
 	rl.buf.WriteString(frame)
 	rl.buf.WriteString("\n\n")
 	rl.frames++
 }
 
-// flush writes the batched frames, if any, in one call and flushes once. It
-// returns the number of frames in the batch, the bytes the ResponseWriter
-// accepted and the write error, in the shape relayStamps.wroteFrames takes,
-// so the request profile counts frames delivered and bytes actually accepted
-// (a failed or short write marks client_write_err) exactly as it did when
-// every frame was its own write. An empty batch returns zeros and neither
-// writes nor flushes.
-func (rl *chatStreamRelay) flush(w http.ResponseWriter, flusher http.Flusher) (frames, n int, err error) {
+// flush writes the batched frames, if any, in one call and flushes once,
+// recording the number of frames in the batch, the bytes the ResponseWriter
+// accepted and the write error through relayStamps.wroteFrames so the request
+// profile counts frames delivered and bytes actually accepted (a failed or
+// short write marks client_write_err) exactly as it did when every frame was
+// its own write. An empty batch neither writes nor flushes.
+//
+// A backing array that grew past maxCoalescedBatchBytes (an oversized frame,
+// or bytes.Buffer's doubling overshooting the cap) is released rather than
+// kept by Reset: a stream that once carried a large burst must not pin that
+// allocation for the rest of its life.
+func (rl *chatStreamRelay) flush() {
 	if rl.buf.Len() == 0 {
-		return 0, 0, nil
+		return
 	}
-	frames = rl.frames
-	n, err = w.Write(rl.buf.Bytes())
-	rl.buf.Reset()
+	frames := rl.frames
+	n, err := rl.w.Write(rl.buf.Bytes())
+	if rl.buf.Cap() > maxCoalescedBatchBytes {
+		rl.buf = bytes.Buffer{}
+	} else {
+		rl.buf.Reset()
+	}
 	rl.frames = 0
-	flusher.Flush()
-	return frames, n, err
+	rl.flusher.Flush()
+	rl.stamps.wroteFrames(frames, n, err)
 }

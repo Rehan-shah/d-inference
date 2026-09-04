@@ -2481,7 +2481,7 @@ func (s *Server) handleStreamingResponseWithFirstChunkAndError(
 	// usage/finish frames, and the batch buffer. Every chunk — the ones already
 	// consumed during dispatch and the ones relayed below — goes through the
 	// same relay.handleChunk pipeline (see chat_stream_relay.go).
-	relay := newChatStreamRelay(pr)
+	relay := newChatStreamRelay(pr, w, flusher, rs)
 
 	// Write the chunks that were already consumed during dispatch (held
 	// preamble first, then the committing content chunk).
@@ -2491,7 +2491,7 @@ func (s *Server) handleStreamingResponseWithFirstChunkAndError(
 		}
 		relay.handleChunk(firstChunk)
 	}
-	rs.wroteFrames(relay.flush(w, flusher))
+	relay.flush()
 	if initialError != nil {
 		s.writeChatStreamProviderError(w, flusher, pr, *initialError)
 		return
@@ -2582,9 +2582,10 @@ func (s *Server) handleStreamingResponseWithFirstChunkAndError(
 			relay.writeFrame("data: " + string(sigEvent))
 		}
 		// Exactly one terminator, after every coordinator-appended event. The
-		// terminal frames reach the wire together in one flush.
+		// terminal frames normally reach the wire together in one flush (the
+		// relay splits a batch only at maxCoalescedBatchBytes).
 		relay.writeFrame("data: [DONE]")
-		rs.wroteFrames(relay.flush(w, flusher))
+		relay.flush()
 		rs.done()
 	}
 
@@ -2611,7 +2612,7 @@ func (s *Server) handleStreamingResponseWithFirstChunkAndError(
 			// observed mid-drain is handled exactly like the blocking-receive
 			// close — after the drained chunks are on the wire.
 			closed := drainQueuedChunks(pr.ChunkCh, maxCoalescedChunks-1, relayChunk)
-			rs.wroteFrames(relay.flush(w, flusher))
+			relay.flush()
 			if closed {
 				finishStream()
 				return
@@ -2626,7 +2627,7 @@ func (s *Server) handleStreamingResponseWithFirstChunkAndError(
 			// (never waiting) before the terminal error so a late failure never
 			// truncates content the provider already produced.
 			drainQueuedChunks(pr.ChunkCh, cap(pr.ChunkCh), relayChunk)
-			rs.wroteFrames(relay.flush(w, flusher))
+			relay.flush()
 			s.writeChatStreamProviderError(w, flusher, pr, errMsg)
 			return
 
