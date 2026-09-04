@@ -2822,7 +2822,7 @@ func (r *Registry) ResolveModelConstrainedWithTraits(
 // structural=true ignores transient slot/cooldown state so alias resolution can
 // queue against a capable build instead of falling back to an incapable one.
 // Self-route to an owned machine relaxes trust and allows private-only
-// providers, mirroring snapshotProviderLocked. Caller holds r.mu.
+// providers, mirroring snapshotProviderIntoLockedEx. Caller holds r.mu.
 func (r *Registry) anyProviderCanServeAliasWithTraitsLocked(
 	buildID string,
 	allowedSerials map[string]struct{},
@@ -2905,7 +2905,7 @@ func (r *Registry) providerStructurallyCanRouteBuildLocked(
 	}
 	// Hardware fit: don't count a provider whose RAM can't hold the build (e.g.
 	// migrating to a larger build than the source). totalMemory prefers the
-	// backend-reported figure, matching snapshotProviderLocked. A resident
+	// backend-reported figure, matching snapshotProviderIntoLockedEx. A resident
 	// running/idle slot has already demonstrated fit and must bypass the
 	// heuristic. Owner-only off-catalog models use their advertised size.
 	totalMemoryGB := float64(p.Hardware.MemoryGB)
@@ -3178,7 +3178,7 @@ func (r *Registry) mergeProviderModels(
 
 // RoutableProviderIDsForBuild returns the ids of providers that would actually
 // pass the routing gate for the build right now — the SAME checks
-// snapshotProviderLocked applies (advertises the build, not offline/untrusted,
+// snapshotProviderIntoLockedEx applies (advertises the build, not offline/untrusted,
 // public, trust ≥ floor, runtime verified, private-text capable, fresh
 // challenge), minus per-request capacity/headroom. Cold-but-healthy providers
 // count (no warm slot required — they load on first demand). Used to measure how
@@ -6110,7 +6110,7 @@ func (r *Registry) publiclyRoutableLocked(p *Provider, now time.Time) bool {
 
 // ModelCapacitySnapshot returns a capacity snapshot for every model served
 // by at least one provider. Providers must pass the same routing gates as
-// snapshotProviderLocked (status, trust, runtime, privacy, challenge
+// snapshotProviderIntoLockedEx (status, trust, runtime, privacy, challenge
 // freshness, concurrency headroom) to be counted as routable.
 func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 	now := time.Now()
@@ -6122,7 +6122,7 @@ func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 	for _, p := range r.providers {
 		p.mu.Lock()
 
-		// Apply the same gates as snapshotProviderLocked. Private-only machines
+		// Apply the same gates as snapshotProviderIntoLockedEx. Private-only machines
 		// never serve the public fleet, so they do not count toward public
 		// model capacity.
 		if !r.publiclyRoutableLocked(p, now) {

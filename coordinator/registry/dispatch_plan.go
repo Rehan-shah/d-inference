@@ -336,7 +336,7 @@ func (r *Registry) ReserveProviderWithPlan(model string, pr *PendingRequest, exc
 //   - identity: r.providers[id] must still be the exact retained *Provider
 //     (a reconnect registers a new object under the same ID — its slot state,
 //     trust, and capacity are a stranger's; see Register/Disconnect);
-//   - snapshotProviderLocked → providerPassesRoutingGatesLocked (every
+//   - snapshotProviderIntoLockedEx → providerPassesRoutingGatesLocked (every
 //     structural/privacy/cooldown/trait gate);
 //   - buildCandidateWithReason (slot state, concurrency headroom, thermal,
 //     hardware fit, freeMemoryAdmits — including the in-flight pending debit
@@ -438,7 +438,7 @@ func (r *Registry) ReserveNextFromPlan(pr *PendingRequest, plan *DispatchPlan, e
 		}
 
 		// Final admit + reservation under p.mu — the same commit sequence as
-		// reserveProvider (snapshotProviderLocked released p.mu, so the admit
+		// reserveProvider (snapshotProviderIntoLockedEx released p.mu, so the admit
 		// re-check closes the snapshot→reserve gap, including the vision gate).
 		p.mu.Lock()
 		if !r.providerCanAdmitLockedEx(p, model, pr.Traits, relaxTrust, false, now) ||

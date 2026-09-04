@@ -13,7 +13,9 @@ the `coordinator/registry/` slice of the perf branch
 `api/` + `store/` + `cmd/`). `perf/coordinator-registry-lock-2026-09-03`
 (Tier 3, `Registry.mu` off the request path) stacks on this branch.
 
-**Scope:** 70 files, all under `coordinator/registry/`. Zero changes to
+**Scope:** 70 files under `coordinator/registry/` plus one documentation
+edit outside it — `docs/architecture/system-profiler.md` (the `scanned` /
+`candidate_set_size` column definitions, see H4). Zero changes to
 `coordinator/api/`, `store/`, `cmd/`, `protocol/`: master's `api/` compiles
 and its tests pass against the new registry unchanged.
 
@@ -115,7 +117,7 @@ the work the scan actually did.
 | H1 | `fleet_sample.go` (#809) called the removed `snapshotProviderReasonLockedEx` / `buildCandidateGateLocked` | `slotEligibilityReasonLocked(p, model, probe, now)` builds one stack `routingCandidate` through `snapshotProviderIntoLockedEx` + `buildCandidateInto` and takes the sampler's clock; header/doc comments updated to the new names. The two removed helpers had no other caller. |
 | H2 | `buildCandidateInto` holds `snap := &c.snapshot`; master's `calibratedTTFTMsWithRatio` was value-typed and its `calibrationRatio` assignment predated the in-place tail | `calibratedTTFTMs` and `calibratedTTFTMsWithRatio` are both pointer-typed; `buildCandidateInto` reads the ratio once, scores with it, and sets `c.calibrationRatio` on success. `TestReserveProviderExTopRunnerUpAndPath` asserts `TTFTCalibrationRatio == 1.0` after reset (a dropped assignment reads 0). |
 | H3 | `snapshotProviderIntoLockedEx` receives `now` but its field list predated `hbAgeMs` | `snap.hbAgeMs = heartbeatAgeMs(now, p.LastHeartbeat)` in the in-place fill; `heartbeatAgeMs` kept. `TestReserveProviderExSnapshotAgeAndPending` asserts `SnapshotAgeMs ≈ 7000` through a real reservation. |
-| H4 | Per-model index: the scan only visits advertisers | **Semantics change, documented, not a bug.** `RoutingDecision.Scanned` is now the advertising count (not the fleet size); `GateRejections[not_serving_model]` is 0 unless an advertiser still fails the catalog rule (off-catalog model on a public route); `CandidateSetSize = Scanned − not_serving_model` is unchanged in meaning. Comments at `RoutingDecision.Scanned` and at the `candidateSetSize` assignment; `TestGateRejectionTallies/not_serving_model` pins the indexed shape (Scanned 0, no tally) and the brute-force shape (`modelIndexDisabled`). Downstream: the profiler's fleet size is available from the 60 s fleet snapshots. |
+| H4 | Per-model index: the scan only visits advertisers | **Semantics change, documented, not a bug.** `RoutingDecision.Scanned` is now the advertising count (not the fleet size); `GateRejections[not_serving_model]` is 0 unless an advertiser still fails the catalog rule (off-catalog model on a public route); `CandidateSetSize = Scanned − not_serving_model` is unchanged in meaning. The same applies to the pre-snapshot `allowlist` / `excluded` tallies, which now count only advertisers (a serial-allowlist miss used to tally ~fleet size per request) — a consumer trending `gate_rejections.allowlist` sees the magnitude drop at deploy. Comments at `RoutingDecision.Scanned` and at the `candidateSetSize` assignment; `TestGateRejectionTallies/not_serving_model` pins the indexed shape (Scanned 0, no tally) and the brute-force shape (`modelIndexDisabled`); `…/not_serving_model_off_catalog` pins the advertiser-fails-catalog branch (Scanned 1, tally 1, set 0). `docs/architecture/system-profiler.md` column definitions updated. Downstream: the profiler's fleet size is available from the 60 s fleet snapshots. |
 | H5 | #799 `routingScanSem` (`NumCPU` slots) shed threshold was calibrated against the old scan cost | Textually orthogonal (the semaphore lives in `api/`). Re-measure `errRoutingScanSaturated` after landing; sizing the semaphore to the container's CPU quota is the Tier-3 follow-up. |
 | H8 | #791 `coldTokenBudgetEstimate(…, providerVersion, modelID)` vs the perf branch's pointer-ified budget helpers | Auto-merged; `servability_test.go` takes both (5-arg calls + `snapPtr`). Activation floors untouched. |
 
@@ -129,6 +131,21 @@ fill passes `&candidate.snapshot` to the now pointer-typed
 `warm_pool_controller.go`) did not materialise: those callers auto-merged
 against master's definitions once `scheduler.go` kept master's profiler
 symbols.
+
+## Review
+
+One independent reviewer (Claude general-purpose agent, read-only + `go test`)
+over the `scheduler.go` / `fleet_sample.go` diff vs `origin/master`: PASS on
+all four items (profiler contract preserved on every drop/success path; index
+== brute-force tests present and 13/13 green incl. `-race`; nothing outside
+`coordinator/registry/`; bench allocs decomposed with pprof and consistent).
+Findings fixed in the follow-up commit: the stale `scanned` definition in
+`docs/architecture/system-profiler.md`, the unpinned off-catalog-advertiser
+branch of H4, and 13 comments still naming the removed `snapshotProviderLocked`
+wrapper. Noted, not changed: `candidateArena.next` and
+`snapshotProviderIntoLockedEx` both zero the slot (~600 B memclr per visited
+provider; the `next()` zero is needed for reused slots); the branch history is
+only safe under squash-merge (master is squash-only — do not rebase-merge).
 
 ## Gates
 

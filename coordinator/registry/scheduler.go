@@ -386,7 +386,10 @@ type RoutingDecision struct {
 	// rule (off-catalog model on a public route). CandidateSetSize is
 	// Scanned − GateNotServingModel rejections either way; providers skipped by
 	// the exclude/allowlist filters, which run before the catalog check, are
-	// counted as advertising. (Pre-index records have Scanned == fleet size.)
+	// counted as advertising. The same applies to the GateAllowlist /
+	// GateExcluded tallies themselves: they now count only advertisers (a
+	// serial-allowlist miss used to tally ~fleet size per request). Pre-index
+	// records have Scanned == fleet size.
 	CandidateSetSize, Scanned int
 	// GateRejections tallies, per closed GateReason, the providers dropped
 	// before cost ranking. Index with GateReason; GateReason.String() is the
@@ -1148,7 +1151,7 @@ func (r *Registry) scanCandidatesLocked(model string, pr *PendingRequest, ignore
 		// un-enrolled) machine — whether exclusive self-route or prefer — never
 		// for public providers.
 		relaxTrust := owned && (pr.SelfRouteOnly || pr.PreferOwner)
-		// snapshotProviderLocked applies every per-provider gate via the shared
+		// snapshotProviderIntoLockedEx applies every per-provider gate via the shared
 		// providerPassesRoutingGatesLocked, INCLUDING the shape-keyed
 		// inference-error cooldown and the trait gates (render-broken fences all
 		// shapes; the tools version floor fences tool requests). A failing
@@ -1617,7 +1620,7 @@ func (r *Registry) logRoutingDecision(model string, pr *PendingRequest, winner *
 
 // providerPassesRoutingGatesLocked is the single source of truth for the
 // per-provider structural/privacy/cooldown/trait gates a request must clear
-// before a provider is eligible to serve it. snapshotProviderLocked (the
+// before a provider is eligible to serve it. snapshotProviderIntoLockedEx (the
 // production dispatch hot path) and QuickCapacityCheck (the preflight) BOTH call
 // it so the two can never drift — a prior bug had QuickCapacityCheck silently
 // missing the dispatch-load cooldown, the inference-error cooldown, and the
@@ -2380,7 +2383,7 @@ func resolvePrefillTPS(snap *routingSnapshot) float64 {
 // per-request decode cost (reqMax / effectiveTPS * 1000) can become
 // very large for big reqMax values. This is intentional — a saturated
 // provider should look strictly worse than less-saturated peers — and
-// the maxConcurrency gate in snapshotProviderLocked already prevents
+// the maxConcurrency gate in snapshotProviderIntoLockedEx already prevents
 // us from getting here when batchSize exceeds the per-tier cap.
 func effectiveDecodeTPS(staticTPS float64, backendRunning int) float64 {
 	if staticTPS <= 0 {
@@ -2796,7 +2799,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 
 		p.mu.Lock()
 
-		// Per-provider routing gates (same source of truth as snapshotProviderLocked
+		// Per-provider routing gates (same source of truth as snapshotProviderIntoLockedEx
 		// and the admit re-check). This pre-flight only runs for public
 		// (non-self-route) requests, so selfRouteOwner is false — private-only
 		// machines are excluded unconditionally.

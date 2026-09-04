@@ -239,6 +239,14 @@ func TestGateRejectionTallies(t *testing.T) {
 			pr.Model = ctxOtherModel
 			return nil
 		}},
+		// H4, the other branch: an ADVERTISER of the requested model that fails
+		// the catalog rule (public route, model absent from a non-nil catalog) IS
+		// visited by the indexed scan and still tallies not_serving_model —
+		// Scanned 1, CandidateSetSize 0.
+		{name: "not_serving_model_off_catalog", want: GateNotServingModel, setup: func(_ *testing.T, reg *Registry, _ *Provider, _ *PendingRequest) []string {
+			reg.SetModelCatalog([]CatalogEntry{{ID: ctxOtherModel, SizeGB: 1}})
+			return nil
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
