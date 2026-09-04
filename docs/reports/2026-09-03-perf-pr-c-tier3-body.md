@@ -201,8 +201,8 @@ tracker on `RemovePending`. None of them is `r.mu`.
   their wall-clock `HBAgeMs`; it flaked 4/40 under `-race` on the loaded box (0/40 on base at that
   moment). The summaries' heartbeat ages are now zeroed like the decision's own `SnapshotAgeMs`.
   Test-only; revert if preferred.
-- No concurrent test drives `ReserveNextFromPlan` (the plan is single-consumer); it is covered by the
-  existing sequential plan suite under `-race`, in the default (shared) mode.
+- `ReserveNextFromPlan` is exercised concurrently with one plan per goroutine (the plan itself is
+  single-consumer); the existing sequential plan suite covers the rest under `-race`.
 
 ## Remaining `r.mu` writers
 
@@ -215,13 +215,17 @@ only read-side touch left near a recorder is the budget snapshot for the clamp
 
 ## Tests
 
-- `reserve_commit_test.go`: exact-capacity concurrent commit (both modes, `-race`); identical routing
-  walks and per-provider gate outcomes across modes under concurrent scans + recorders over the
-  fault-state fixture (breaker-open, ejected, capacity-cooled, dispatch-load-cooled,
-  error-cooled, budget-clamped); the parallel speed-up guard.
-- `gate_state_test.go`: stale-pointer migration, shared-identity rebind, sweep liveness rule,
-  trailing-flush resolution, exclusive probe claim, nil-safety, wait observer, recorders never block
-  behind `r.mu.Lock`.
+- `reserve_commit_test.go`: exact-capacity concurrent commit through `ReserveProviderEx` AND through
+  `ReserveNextFromPlan` (both modes, `-race`); the half-open probe race end to end — two sessions of
+  one identity, N concurrent reservations, exactly one admitted (both modes); identical routing walks
+  and per-provider gate outcomes across modes before/after concurrent scans + recorders over the
+  fault-state fixture (breaker-open, ejected, capacity-cooled, dispatch-load-cooled, error-cooled,
+  budget-clamped — the recorders in the concurrent phase target healthy providers, so this is
+  `-race` interleaving coverage plus "faulted stay excluded", not a decision-changing script); the
+  parallel speed-up guard; the mode-flag parser (unknown values fall back to `shared` and are logged).
+- `gate_state_test.go`: stale-pointer migration, no empty-gate window for lock-free readers during a
+  live re-attestation, shared-identity rebind, sweep liveness rule, trailing-flush resolution,
+  exclusive probe claim, nil-safety, wait observer, recorders never block behind `r.mu.Lock`.
 - `request_path_probe_test.go`: the probe benches from 01.
 - Existing tracker suites adapted to the gate API (helpers only; assertions unchanged); index ==
   brute-force, routing_context, fleet_sample and gate-tally suites untouched and green.

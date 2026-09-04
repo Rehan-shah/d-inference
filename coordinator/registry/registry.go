@@ -2362,7 +2362,7 @@ func New(logger *slog.Logger) *Registry {
 		gates:                       make(map[string]*gateState),
 		sessions:                    make(map[string]*Provider),
 		disconnectedStableIDs:       make(map[string]disconnectedStableID),
-		reserveCommitMode:           loadReserveCommitMode(),
+		reserveCommitMode:           loadReserveCommitMode(logger),
 		capacityCooldownCfg:         loadCapacityCooldownConfig(),
 		budgetClampCfg:              loadBudgetClampConfig(),
 		capacityRateCfg:             loadCapacityRateConfig(),
@@ -2858,7 +2858,7 @@ func (r *Registry) providerCanRouteBuildLocked(p *Provider, buildID string, minT
 	) {
 		return false
 	}
-	if r.dispatchLoadCooled(p.ID, buildID, now) {
+	if r.gateOf(p).dispatchLoadCooled(buildID, now) {
 		return false
 	}
 	if p.BackendCapacity != nil {

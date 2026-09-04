@@ -27,16 +27,20 @@ func setReserveCommitModeForTest(r *Registry, mode reserveCommitMode) {
 }
 
 func TestParseReserveCommitMode(t *testing.T) {
-	cases := map[string]reserveCommitMode{
-		"":         reserveCommitShared,
-		"shared":   reserveCommitShared,
-		"anything": reserveCommitShared,
-		"global":   reserveCommitGlobal,
-		" GLOBAL ": reserveCommitGlobal,
+	cases := map[string]struct {
+		mode  reserveCommitMode
+		known bool
+	}{
+		"":         {reserveCommitShared, true},
+		"shared":   {reserveCommitShared, true},
+		"anything": {reserveCommitShared, false}, // a typo falls back to shared AND is reported
+		"global":   {reserveCommitGlobal, true},
+		" GLOBAL ": {reserveCommitGlobal, true},
 	}
 	for raw, want := range cases {
-		if got := parseReserveCommitMode(raw); got != want {
-			t.Errorf("parseReserveCommitMode(%q) = %s, want %s", raw, got, want)
+		mode, known := parseReserveCommitMode(raw)
+		if mode != want.mode || known != want.known {
+			t.Errorf("parseReserveCommitMode(%q) = (%s, %v), want (%s, %v)", raw, mode, known, want.mode, want.known)
 		}
 	}
 	if New(testLogger()).reserveCommitMode != reserveCommitShared {
@@ -149,6 +153,183 @@ func TestReserveCommitAdmitsExactlyTheSerialCapacityUnderConcurrency(t *testing.
 			if n := pendingCountOf(p); n != 0 {
 				t.Fatalf("round %d: pending after release = %d, want 0", round, n)
 			}
+		}
+	})
+}
+
+// TestReserveNextFromPlanAdmitsExactlyTheSerialCapacityUnderConcurrency is the
+// plan-path twin of the test above: N goroutines, each consuming its own plan
+// whose next entry is the same capped alternate, admit exactly the serial
+// capacity — the snapshot, admit re-check, probe claim and debit share one
+// p.mu hold in tryReserve too, in both commit modes.
+func TestReserveNextFromPlanAdmitsExactlyTheSerialCapacityUnderConcurrency(t *testing.T) {
+	forEachCommitMode(t, func(t *testing.T, mode reserveCommitMode) {
+		reg := New(testLogger())
+		setReserveCommitModeForTest(reg, mode)
+		const model = "plan-cap-model"
+		// The winner is only there to be excluded from every plan; the
+		// alternate is the capped provider every plan consumes next.
+		winner := makeSchedulerProvider(t, reg, "plan-winner", model, 100)
+		alt := makeSchedulerProvider(t, reg, "plan-alt", model, 100)
+		alt.mu.Lock()
+		alt.BackendCapacity.Slots[0].MaxConcurrency = 4
+		alt.mu.Unlock()
+		newReq := func(i int) *PendingRequest {
+			return &PendingRequest{
+				RequestID:             fmt.Sprintf("plan-%s-%d", mode, i),
+				Model:                 model,
+				EstimatedPromptTokens: 200,
+				RequestedMaxTokens:    128,
+				FirstContentBudgetMS:  10_000,
+				FirstContentDeadline:  time.Now().Add(10 * time.Second),
+			}
+		}
+		planFor := func(pr *PendingRequest) *DispatchPlan {
+			reg.mu.RLock()
+			scan := reg.scanCandidatesLocked(model, pr, false)
+			reg.mu.RUnlock()
+			var w *routingCandidate
+			for _, c := range scan.pool {
+				if c.provider == winner {
+					w = c
+				}
+			}
+			if w == nil {
+				t.Fatal("winner missing from the scan pool")
+			}
+			// The alternate is the plan's only entry while it has headroom and
+			// drops out of the scan pool (hence the plan) once it is full.
+			plan := newDispatchPlan(model, scan, w)
+			if plan.Len() > 1 || (plan.Len() == 1 && plan.entries[0].provider != alt) {
+				t.Fatalf("plan must hold at most the alternate, got %d entries", plan.Len())
+			}
+			return plan
+		}
+
+		var serial []*PendingRequest
+		for i := 0; i < 64; i++ {
+			pr := newReq(i)
+			plan := planFor(pr)
+			if plan.Len() == 0 {
+				break
+			}
+			got, _, _ := reg.ReserveNextFromPlan(pr, plan)
+			if got == nil {
+				break
+			}
+			serial = append(serial, pr)
+		}
+		capacity := len(serial)
+		if capacity < 2 || capacity > 4 {
+			t.Fatalf("serial plan capacity = %d, want 2..4", capacity)
+		}
+		for _, pr := range serial {
+			alt.RemovePending(pr.RequestID)
+		}
+
+		const workers = 32
+		for round := 0; round < 5; round++ {
+			reqs := make([]*PendingRequest, workers)
+			plans := make([]*DispatchPlan, workers)
+			for i := range reqs {
+				reqs[i] = newReq(1000 + round*workers + i)
+				plans[i] = planFor(reqs[i])
+				if plans[i].Len() != 1 {
+					t.Fatalf("round %d: plan %d must hold the idle alternate", round, i)
+				}
+			}
+			var admitted atomic.Int32
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for i := range reqs {
+				wg.Add(1)
+				go func(pr *PendingRequest, plan *DispatchPlan) {
+					defer wg.Done()
+					<-start
+					got, _, _ := reg.ReserveNextFromPlan(pr, plan)
+					if got == nil {
+						return
+					}
+					if got != alt {
+						t.Errorf("plan reserved a stranger: %v", got)
+					}
+					admitted.Add(1)
+				}(reqs[i], plans[i])
+			}
+			close(start)
+			wg.Wait()
+			if int(admitted.Load()) != capacity {
+				t.Fatalf("round %d: %d admitted concurrently through plans, serial capacity is %d", round, admitted.Load(), capacity)
+			}
+			if n := pendingCountOf(alt); n != capacity {
+				t.Fatalf("round %d: pending set holds %d, want %d", round, n, capacity)
+			}
+			for _, pr := range reqs {
+				if pr.ProviderID == alt.ID {
+					alt.RemovePending(pr.RequestID)
+				}
+			}
+			if n := pendingCountOf(alt); n != 0 {
+				t.Fatalf("round %d: pending after release = %d, want 0", round, n)
+			}
+		}
+	})
+}
+
+// TestCommitProbeClaimAdmitsExactlyOneAcrossSessions drives the half-open
+// probe claim end to end through ReserveProviderEx: two sessions of ONE
+// identity serve the model, the identity's capacity cooldown has expired, and
+// N concurrent reservations must admit exactly one request — the probe — with
+// the gate closed to everyone else afterwards. Commits on different providers
+// do not share p.mu; only the check-and-claim under gate.mu makes this exact.
+func TestCommitProbeClaimAdmitsExactlyOneAcrossSessions(t *testing.T) {
+	forEachCommitMode(t, func(t *testing.T, mode reserveCommitMode) {
+		reg := New(testLogger())
+		setReserveCommitModeForTest(reg, mode)
+		const model = "probe-race-model"
+		p1 := attestSchedulerProvider(t, reg, "probe-sess-1", model, "SER-PROBE-RACE", 100)
+		p2 := attestSchedulerProvider(t, reg, "probe-sess-2", model, "SER-PROBE-RACE", 100)
+		for i := 0; i < reg.capacityCooldownCfg.Threshold; i++ {
+			reg.RecordCapacityReject(p1.ID, model)
+		}
+		if !reg.CapacityCooldownActive(p2.ID, model) {
+			t.Fatal("precondition: the identity's cooldown must gate both sessions")
+		}
+		expireCapacityCooldown(reg, p1.ID, model)
+
+		const workers = 16
+		reqs := make([]*PendingRequest, workers)
+		var admitted atomic.Int32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range reqs {
+			reqs[i] = &PendingRequest{
+				RequestID:             fmt.Sprintf("probe-%s-%d", mode, i),
+				Model:                 model,
+				EstimatedPromptTokens: 200,
+				RequestedMaxTokens:    128,
+				FirstContentBudgetMS:  10_000,
+				FirstContentDeadline:  time.Now().Add(10 * time.Second),
+			}
+			wg.Add(1)
+			go func(pr *PendingRequest) {
+				defer wg.Done()
+				<-start
+				if got, _ := reg.ReserveProviderEx(model, pr); got != nil {
+					admitted.Add(1)
+				}
+			}(reqs[i])
+		}
+		close(start)
+		wg.Wait()
+		if admitted.Load() != 1 {
+			t.Fatalf("%d reservations admitted through an expired cooldown, want exactly the one probe", admitted.Load())
+		}
+		if n := pendingCountOf(p1) + pendingCountOf(p2); n != 1 {
+			t.Fatalf("pending across the identity's sessions = %d, want 1", n)
+		}
+		if !reg.CapacityCooldownActive(p1.ID, model) || !reg.CapacityCooldownActive(p2.ID, model) {
+			t.Fatal("the claimed probe must close the gate for both sessions")
 		}
 	})
 }

@@ -390,7 +390,16 @@ func (r *Registry) RecordCapacityAcceptOutcome(providerID, modelID string, count
 	if providerID == "" || modelID == "" {
 		return false
 	}
-	g := r.gateForSession(providerID)
+	// An identity with no gate has nothing to clear; create one only when
+	// there is a rate outcome to record, so a straggling accept for a dead
+	// session does not file a gate under its id.
+	g := r.lookupGateForSession(providerID)
+	if g == nil {
+		if !countRateOutcome || r.capacityRateCfg.PenaltyMs <= 0 {
+			return false
+		}
+		g = r.gateForSession(providerID)
+	}
 	var heartbeatAt time.Time
 	var rawRemaining int64
 	var budgetReported bool
@@ -411,9 +420,12 @@ func (r *Registry) RecordCapacityAcceptOutcome(providerID, modelID string, count
 	// IS the signal). Then drop the entry if it is now inactive (this accept
 	// completed the release proof, the TTL lapsed, or it was armed budgetless):
 	// a lingering inactive entry would keep re-blocking the identity's next
-	// budgetless reconnect window. (A clamp armed between the flag peek above
-	// and this section sees a zero snapshot: it keeps holding, and the next
-	// heartbeat or accept releases it — never a false release.)
+	// budgetless reconnect window. The snapshot was read before the gate was
+	// taken (lock order p.mu → gate.mu), so two benign races exist: a clamp
+	// armed in between sees a zero snapshot and keeps holding, and a heartbeat
+	// delivered in between already ran its own release pass before
+	// acceptedSince was set, so the release lands on the NEXT heartbeat or
+	// accept. Neither can release early.
 	if e, hasClamp := g.budgetClamps[modelID]; hasClamp {
 		e.acceptedSince = true
 		g.dropInactiveBudgetClampLocked(r.budgetClampCfg, modelID, heartbeatAt, rawRemaining, budgetReported, now)
