@@ -5017,10 +5017,28 @@ func mergeHeartbeatSessionStats(previous, current protocol.HeartbeatStats) proto
 
 // Disconnect removes a provider from the registry and cleans up pending requests.
 func (r *Registry) Disconnect(id string) {
+	r.disconnectProvider(id, nil, 0)
+}
+
+// disconnectProvider applies an optional eviction guard atomically with removal.
+// expected is the exact session observed by the stale scan; nil is an ordinary
+// unconditional disconnect. Both its identity and latest heartbeat are checked
+// while r.mu and p.mu exclude replacement and heartbeat updates.
+func (r *Registry) disconnectProvider(id string, expected *Provider, timeout time.Duration) bool {
 	var disconnectedModels []string
 	r.mu.Lock()
 	p, ok := r.providers[id]
 	if ok {
+		if expected != nil && p != expected {
+			r.mu.Unlock()
+			return false
+		}
+		p.mu.Lock()
+		if expected != nil && time.Since(p.LastHeartbeat) <= timeout {
+			p.mu.Unlock()
+			r.mu.Unlock()
+			return false
+		}
 		delete(r.providers, id)
 		// Clear any pending model load entries for this provider.
 		for key := range r.pendingModelLoads {
@@ -5029,7 +5047,6 @@ func (r *Registry) Disconnect(id string) {
 				delete(r.pendingModelLoadStarted, key)
 			}
 		}
-		p.mu.Lock()
 		p.detachModelIndexLocked(r)
 		// FAULT STATE IS NOT CLEARED ON DISCONNECT. Every fault-tracking map
 		// (node-health breaker, inference-error cooldowns, dispatch-load
@@ -5082,7 +5099,7 @@ func (r *Registry) Disconnect(id string) {
 	r.mu.Unlock()
 
 	if !ok {
-		return
+		return false
 	}
 	// Removing the last capable provider can turn a queued constrained request
 	// from temporarily capacity-blocked into permanently unservable. Re-run
@@ -5171,6 +5188,7 @@ func (r *Registry) Disconnect(id string) {
 	}
 
 	r.logger.Info("provider disconnected", "provider_id", id)
+	return true
 }
 
 // GetProvider returns a provider by ID, or nil if not found.
@@ -6464,7 +6482,7 @@ func (r *Registry) evictStale(timeout time.Duration) {
 	fleet := len(r.providers)
 	ages := make([]time.Duration, 0, fleet)
 	var nextStrikes map[string]int // allocated lazily: steady state carries nothing
-	var toEvict []string
+	var toEvict []*Provider
 	var evictAges []time.Duration
 	for id, p := range r.providers {
 		p.mu.Lock()
@@ -6475,7 +6493,7 @@ func (r *Registry) evictStale(timeout time.Duration) {
 		if age > timeout {
 			strikes := r.evictStrikes[id] + 1
 			if strikes >= evictStrikeThreshold {
-				toEvict = append(toEvict, id)
+				toEvict = append(toEvict, p)
 				evictAges = append(evictAges, age)
 			} else {
 				if nextStrikes == nil {
@@ -6518,9 +6536,12 @@ func (r *Registry) evictStale(timeout time.Duration) {
 		)
 	}
 
-	for _, id := range toEvict {
-		r.logger.Warn("evicting stale provider", "provider_id", id, "timeout", timeout)
-		r.Disconnect(id)
+	for _, p := range toEvict {
+		// A heartbeat may recover this session after the read scan, or the
+		// same id may name a replacement. Revalidate inside the removal lock.
+		if r.disconnectProvider(p.ID, p, timeout) {
+			r.logger.Warn("evicted stale provider", "provider_id", p.ID, "timeout", timeout)
+		}
 	}
 }
 
