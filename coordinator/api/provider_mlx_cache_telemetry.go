@@ -15,8 +15,10 @@ import (
 // Cardinality: tags are bounded — chip_family and provider_version — never a
 // provider id. The previous per-provider gauges were tagged by the connection
 // UUID, so every reconnect minted a fresh series (~9 gauges × fleet, churning).
-// Point-in-time values are emitted as histograms (agent-side avg/max/p95/count
-// across the fleet per tag set); the provider's cumulative reclaimer counters
+// Point-in-time values are emitted as histograms with DogStatsD (agent-side
+// avg/max/p95/count across the fleet per tag set), or as latest-value gauges
+// per bounded tag set when the HTTPS series API is configured. HTTP gauges
+// preserve visibility without claiming fleet percentiles. Reclaimer counters
 // are converted to per-heartbeat deltas against prev (the capacity snapshot
 // taken before this heartbeat was applied) and emitted as counts, so a
 // fleet-wide reclaim rate survives aggregation. prev is nil on a session's
@@ -27,15 +29,15 @@ func (s *Server) recordMLXCacheTelemetry(provider *registry.Provider, prev, capa
 		return
 	}
 	tags := mlxTelemetryTags(provider)
-	s.ddHistogram("provider.mlx_memory.active_gb", capacity.GPUMemoryActiveGB, tags)
-	s.ddHistogram("provider.mlx_memory.peak_gb", capacity.GPUMemoryPeakGB, tags)
-	s.ddHistogram("provider.mlx_memory.cache_gb", capacity.GPUMemoryCacheGB, tags)
+	s.dd.HistogramOrGauge("provider.mlx_memory.active_gb", capacity.GPUMemoryActiveGB, tags)
+	s.dd.HistogramOrGauge("provider.mlx_memory.peak_gb", capacity.GPUMemoryPeakGB, tags)
+	s.dd.HistogramOrGauge("provider.mlx_memory.cache_gb", capacity.GPUMemoryCacheGB, tags)
 
 	reclaimer := capacity.MLXCacheReclaimer
 	if reclaimer == nil {
 		return
 	}
-	s.ddHistogram("provider.mlx_cache.limit_bytes", float64(reclaimer.CacheLimitBytes), tags)
+	s.dd.HistogramOrGauge("provider.mlx_cache.limit_bytes", float64(reclaimer.CacheLimitBytes), tags)
 
 	if prev == nil || prev.MLXCacheReclaimer == nil {
 		return
@@ -48,8 +50,8 @@ func (s *Server) recordMLXCacheTelemetry(provider *registry.Provider, prev, capa
 		// The last_* fields describe the most recent reclaim; sample them
 		// only when a reclaim happened since the previous heartbeat so the
 		// distribution is of reclaims, not of heartbeats.
-		s.ddHistogram("provider.mlx_cache.last_reclaimed_bytes", float64(reclaimer.LastReclaimedBytes), tags)
-		s.ddHistogram("provider.mlx_cache.last_reclaim_duration_ms", float64(reclaimer.LastReclaimDurationMS), tags)
+		s.dd.HistogramOrGauge("provider.mlx_cache.last_reclaimed_bytes", float64(reclaimer.LastReclaimedBytes), tags)
+		s.dd.HistogramOrGauge("provider.mlx_cache.last_reclaim_duration_ms", float64(reclaimer.LastReclaimDurationMS), tags)
 	}
 }
 
