@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -61,12 +62,14 @@ const gateWaitReportThreshold = time.Millisecond
 const gateIdleGrace = 10 * time.Minute
 
 // gateSweepHighWater is the gate count above which an insert triggers an
-// inline sweep (rate-limited by gateSweepMinInterval) in addition to the
-// periodic sweep from the eviction loop, so the map stays bounded even if the
-// loop is not running.
+// inline sweep (rate-limited by gateSweepMinInterval) so the index stays
+// bounded even when the eviction loop is not running. The loop sweeps every
+// timeout/3 (30 s at the default), so with a 60 s minimum interval the inline
+// path — a walk of every gate under gatesMu.Lock, on a recorder's insert —
+// never fires in a process that runs the loop.
 const (
 	gateSweepHighWater   = 4096
-	gateSweepMinInterval = 10 * time.Second
+	gateSweepMinInterval = 60 * time.Second
 )
 
 // modelShapeKey identifies an inference-error bucket inside one gate:
@@ -696,19 +699,24 @@ func (r *Registry) bindStableFaultKey(p *Provider, stableID string) {
 		return
 	}
 	target := r.ensureGateLocked(targetKey, now)
+	if cur != nil && stableID != "" {
+		// Migrate BEFORE repointing the session: a lock-free reader that loads
+		// p.gate must find either cur's intact pre-migration view or a target
+		// that already carries the merged state, never an empty target. (An
+		// unbind never migrates: session keying resumes and the identity keeps
+		// its state.) cur is orphaned when this was its last live session.
+		//
+		// A recorder that resolved a SHARED cur (another session still bound to
+		// it) just before this rebind lands its outcome on cur's now-empty
+		// state, not on the enriched identity — exactly what the map-keyed
+		// implementation did when the old key was re-created after the move.
+		r.migrateGateLocked(cur, target, cur.live <= 1)
+	}
 	target.live++
-	// Repoint the session first: from here every new resolution lands on the
-	// target, and a reader still holding cur either sees cur's pre-migration
-	// state or follows forwardTo once it is set.
 	p.gate.Store(target)
-	if cur == nil {
-		return
+	if cur != nil {
+		cur.live--
 	}
-	cur.live--
-	if stableID == "" {
-		return // unbind: session keying resumes; the identity keeps its state
-	}
-	r.migrateGateLocked(cur, target, cur.live <= 0)
 }
 
 // migrateGateLocked re-keys accumulated fault state from src to dst (merge
@@ -725,15 +733,20 @@ func (r *Registry) migrateGateLocked(src, dst *gateState, orphan bool) {
 	dst.mergeLocked(src)
 	dst.publishLocked()
 	if orphan {
-		// Forward BEFORE resetting: a lock-free reader that loaded src sees
-		// either its intact pre-merge view or the forward, never the reset.
+		// Forward BEFORE resetting, and never republish the orphan: a
+		// lock-free reader that loaded src sees either its intact pre-merge
+		// atomics (stale but conservative — expiries merged by max into dst)
+		// or the forward, never zeros. Locked reads follow the forward.
 		src.forwardTo.Store(dst)
 		if r.gates[src.key] == src {
 			delete(r.gates, src.key)
 		}
+		src.resetLocked()
+	} else {
+		// Still bound to other sessions: it starts from nothing, visibly.
+		src.resetLocked()
+		src.publishLocked()
 	}
-	src.resetLocked()
-	src.publishLocked()
 	dst.mu.Unlock()
 	src.mu.Unlock()
 }
@@ -802,15 +815,28 @@ const (
 // once at Registry construction.
 const envReserveCommitMode = "EIGENINFERENCE_RESERVE_COMMIT_MODE"
 
-func loadReserveCommitMode() reserveCommitMode {
-	return parseReserveCommitMode(os.Getenv(envReserveCommitMode))
+func loadReserveCommitMode(logger *slog.Logger) reserveCommitMode {
+	raw := os.Getenv(envReserveCommitMode)
+	mode, known := parseReserveCommitMode(raw)
+	if !known && logger != nil {
+		// A kill switch that silently ignores a typo is not a kill switch.
+		logger.Warn("unknown reserve commit mode; using shared",
+			"env", envReserveCommitMode, "value", raw)
+	}
+	return mode
 }
 
-func parseReserveCommitMode(raw string) reserveCommitMode {
-	if strings.EqualFold(strings.TrimSpace(raw), "global") {
-		return reserveCommitGlobal
+// parseReserveCommitMode maps the raw value to a mode; known reports whether
+// the value named one ("" and "shared" are shared, "global" is global).
+func parseReserveCommitMode(raw string) (mode reserveCommitMode, known bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "shared":
+		return reserveCommitShared, true
+	case "global":
+		return reserveCommitGlobal, true
+	default:
+		return reserveCommitShared, false
 	}
-	return reserveCommitShared
 }
 
 func (m reserveCommitMode) String() string {

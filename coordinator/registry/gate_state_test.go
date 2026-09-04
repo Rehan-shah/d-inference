@@ -54,6 +54,43 @@ func TestStaleGatePointerFollowsIdentityMigration(t *testing.T) {
 	}
 }
 
+// During a live re-attestation that changes the identity, a lock-free reader
+// must never see the identity's fault state vanish: the orphaned session gate
+// keeps its (conservative) atomics — it is never republished after the reset
+// — and the provider's cached pointer is repointed only once the target
+// carries the merged state.
+func TestMigrationNeverExposesAnEmptyGateToLockFreeReaders(t *testing.T) {
+	reg := New(testLogger())
+	p := makeSchedulerProvider(t, reg, "sess-mig-view", "m", 100)
+	for i := 0; i < providerBreakerConsecTrip; i++ {
+		reg.RecordProviderOutcome(p.ID, false, 500, "internal error")
+	}
+	stale := p.gate.Load()
+	nowNS := time.Now().UnixNano()
+	if !stale.breakerOpenAt(nowNS) {
+		t.Fatal("precondition: breaker open on the session gate")
+	}
+
+	p.SetAttestationResult(&attestation.VerificationResult{Valid: true, SerialNumber: "SER-MIG-VIEW"})
+
+	target := p.gate.Load()
+	if target == stale || target.key != "serial:SER-MIG-VIEW" {
+		t.Fatalf("cached gate after bind = %+v, want the identity's gate", target)
+	}
+	if !target.breakerOpenAt(nowNS) {
+		t.Fatal("the target must carry the merged breaker state when the pointer is repointed")
+	}
+	if !stale.breakerOpenAt(nowNS) {
+		t.Fatal("the orphaned gate's atomics must stay conservative (never republished after the reset)")
+	}
+	if stale.forwardTo.Load() != target || !stale.resolve().breakerOpenAt(nowNS) {
+		t.Fatal("the orphan must forward to the live gate")
+	}
+	if !reg.ProviderBreakerOpen(p.ID) {
+		t.Fatal("the breaker must read open through the session after the rebind")
+	}
+}
+
 // A rebind that moves ONE of two sessions bound to the same identity must not
 // orphan the shared gate: the other session still points at it, so it stays
 // in the index (emptied, as the map-keyed implementation left the old key).
