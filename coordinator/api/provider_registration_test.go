@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/eigeninference/d-inference/coordinator/attestation"
@@ -221,9 +222,9 @@ func TestProviderRegistrationAttestationFreshnessVersionGate(t *testing.T) {
 			accepted:        true,
 		},
 		{
-			name:            "capability release rejects future skew beyond freshness window",
+			name:            "capability release rejects future skew just over boundary",
 			version:         minProviderVersionForReconnectAttestation,
-			timestampOffset: RegistrationAttestationMaxFutureSkew + time.Minute,
+			timestampOffset: RegistrationAttestationMaxFutureSkew + time.Second,
 		},
 		{
 			name:     "capability release accepts fresh reconnect",
@@ -234,54 +235,57 @@ func TestProviderRegistrationAttestationFreshnessVersionGate(t *testing.T) {
 
 	for index, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			reg := registry.New(logger)
-			srv := NewServer(
-				reg,
-				store.NewMemory(store.Config{AdminKey: "test-key"}),
-				ServerConfig{},
-				logger,
-			)
-			publicKey := testPublicKeyB64()
-			// Construct each signed timestamp immediately before its case runs.
-			// The wire fixture uses whole seconds, so the rejected future case
-			// stays a minute outside the window: a one-second margin could be
-			// rounded away and cross inside while earlier cases were running.
-			timestamp := time.Now().Add(tc.timestampOffset)
-			regMsg := &protocol.RegisterMessage{
-				Type:      protocol.TypeRegister,
-				Version:   tc.version,
-				PublicKey: publicKey,
-				Attestation: buildTestAttestationJSONWithFields(
-					t, publicKey, "", "", timestamp, nil),
-			}
-			provider := reg.Register(fmt.Sprintf("reconnect-%d", index), nil, regMsg)
-			srv.verifyProviderAttestation(provider.ID, provider, regMsg)
+			synctest.Test(t, func(t *testing.T) {
+				logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+				reg := registry.New(logger)
+				srv := NewServer(
+					reg,
+					store.NewMemory(store.Config{AdminKey: "test-key"}),
+					ServerConfig{},
+					logger,
+				)
+				defer srv.Close()
+				publicKey := testPublicKeyB64()
+				// The bubble freezes time at a whole-second instant while this
+				// synchronous verification runs, so the signed fixture keeps exact
+				// below/at/one-second-over boundary coverage without aging between
+				// construction and CheckTimestamp. Production clocks are untouched.
+				timestamp := time.Now().Add(tc.timestampOffset)
+				regMsg := &protocol.RegisterMessage{
+					Type:      protocol.TypeRegister,
+					Version:   tc.version,
+					PublicKey: publicKey,
+					Attestation: buildTestAttestationJSONWithFields(
+						t, publicKey, "", "", timestamp, nil),
+				}
+				provider := reg.Register(fmt.Sprintf("reconnect-%d", index), nil, regMsg)
+				srv.verifyProviderAttestation(provider.ID, provider, regMsg)
 
-			provider.Mu().Lock()
-			defer provider.Mu().Unlock()
-			if tc.accepted {
-				if provider.Status == registry.StatusUntrusted ||
+				provider.Mu().Lock()
+				defer provider.Mu().Unlock()
+				if tc.accepted {
+					if provider.Status == registry.StatusUntrusted ||
+						provider.AttestationResult == nil ||
+						!provider.AttestationResult.Valid {
+						t.Fatalf("freshness-compatible registration rejected: status=%s result=%+v",
+							provider.Status, provider.AttestationResult)
+					}
+					if provider.LastChallengeVerified.IsZero() {
+						t.Fatal("accepted registration did not initialize periodic challenge freshness")
+					}
+					return
+				}
+				if provider.Status != registry.StatusUntrusted ||
 					provider.AttestationResult == nil ||
-					!provider.AttestationResult.Valid {
-					t.Fatalf("freshness-compatible registration rejected: status=%s result=%+v",
+					provider.AttestationResult.Error != "attestation timestamp outside freshness window" {
+					t.Fatalf("replayed attestation state = status=%s result=%+v",
 						provider.Status, provider.AttestationResult)
 				}
-				if provider.LastChallengeVerified.IsZero() {
-					t.Fatal("accepted registration did not initialize periodic challenge freshness")
+				if len(provider.RuntimeCapabilities) != 0 {
+					t.Fatalf("replayed attestation retained capabilities: %v",
+						provider.RuntimeCapabilities)
 				}
-				return
-			}
-			if provider.Status != registry.StatusUntrusted ||
-				provider.AttestationResult == nil ||
-				provider.AttestationResult.Error != "attestation timestamp outside freshness window" {
-				t.Fatalf("replayed attestation state = status=%s result=%+v",
-					provider.Status, provider.AttestationResult)
-			}
-			if len(provider.RuntimeCapabilities) != 0 {
-				t.Fatalf("replayed attestation retained capabilities: %v",
-					provider.RuntimeCapabilities)
-			}
+			})
 		})
 	}
 }
