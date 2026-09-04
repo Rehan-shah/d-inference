@@ -1,6 +1,6 @@
 # Reports — dated records
 
-> Last updated: 2026-09-03 · commit `5d400cf75`
+> Last updated: 2026-09-04 · commit `4a08f2a44`
 
 Frozen records: incident analyses, measurements, experiment results, and
 migration records. Each file describes the code **as it was on its date**; none
@@ -59,9 +59,15 @@ Plans and decision memos live in [`../design/`](../design/README.md).
 
 | Date | Report | One line |
 |---|---|---|
+## Coordinator performance program (2026-09)
+
+| Date | Report | One line |
+|---|---|---|
 | 2026-09-02 | [coordinator-performance-program](2026-09-02-coordinator-performance-program.md) | First-principles pass over every coordinator operation with a measurable cost: fleet-scale benchmarks, store cache, route batching, relay coalescing, parse-once bodies |
 | 2026-09-02 | [coordinator-performance-pr-body](2026-09-02-coordinator-performance-pr-body.md) | Original PR body of the 75-commit program branch, kept as the record |
 | 2026-09-03 | [perf-pr-a-body](2026-09-03-perf-pr-a-body.md) | Landing the store/api half of the program on master (read-through cache, batched route sink, parse-once bodies, relay coalescing) |
+| 2026-09-03 | [perf-pr-b-body](2026-09-03-perf-pr-b-body.md) | PR description for the routing-scan landing (PR B): per-model provider index, in-place snapshots, TPS median caches, version memos, heartbeat swap-plan coalescing; before/after benchmarks and the `scanned` semantics change |
+
 
 ## Raw benchmark outputs
 
