@@ -125,6 +125,11 @@ func (r *Registry) RecordInferenceError(providerID, modelID string, statusCode i
 	}
 	kept = append(kept, now)
 	r.inferenceErrorStrikes[key] = kept
+	// The disconnect-flush tags (version_reset.go) must stay a subset of the
+	// live strikes: slide their window with the strikes, or an identity that
+	// churns on the SAME version for weeks — the reset never fires for it —
+	// keeps every flushed request's timestamp forever.
+	r.pruneInferenceFlushStrikesLocked(key, now)
 	// Tag the disconnect-flush strike so a version-changed reconnect can
 	// remove exactly it (version_reset.go).
 	if statusCode == disconnectFlushStatusCode {
@@ -156,6 +161,8 @@ func (r *Registry) RecordInferenceSuccess(providerID, modelID, shape string) {
 	key := inferenceErrorKey{ProviderID: r.faultKeyLocked(providerID), ModelID: modelID, Shape: shape}
 	delete(r.inferenceErrorStrikes, key)
 	delete(r.inferenceErrorCooldowns, key)
+	// The flush tags mark strikes that no longer exist.
+	delete(r.inferenceErrorFlushStrikes, key)
 }
 
 // InferenceErrorCooldownActive reports whether the (provider, model, shape)

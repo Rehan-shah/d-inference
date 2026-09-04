@@ -206,3 +206,97 @@ func TestVersionChangedReconnect_ResetIsRateLimitedPerIdentity(t *testing.T) {
 	bindVersionedSession(t, r, "s4", "0.9.3", false)
 	assertIdentityQuarantine(t, r, "s4", false)
 }
+
+// TestInferenceFlushStrikes_BoundedForSameVersionIdentity: an identity that
+// churns on the SAME binary version never triggers the version reset, so its
+// disconnect-flush tags were append-only — the main strikes slid out of the
+// breaker window and a success deleted them, but every flushed request kept a
+// time.Time under the identity forever. Seed 10,000 flushed requests spread
+// over hours (each also in the main strike list, exactly as RecordInferenceError
+// writes them), record one more flush, and the tag slice must be bounded by
+// the breaker window and remain a subset of the strikes; a success clears it.
+func TestInferenceFlushStrikes_BoundedForSameVersionIdentity(t *testing.T) {
+	r := New(testLogger())
+	bindVersionedSession(t, r, "s1", "0.9.0", true)
+	key := inferenceErrorKey{ProviderID: versionResetStable, ModelID: "m", Shape: "base"}
+
+	const flushed = 10_000
+	now := time.Now()
+	seed := make([]time.Time, 0, flushed)
+	for i := 0; i < flushed; i++ {
+		// One flush every 2 s, the newest 2 s ago: ~30 fall inside the 60 s
+		// breaker window, the rest are hours old.
+		seed = append(seed, now.Add(-time.Duration(flushed-i)*2*time.Second))
+	}
+	r.mu.Lock()
+	r.inferenceErrorStrikes[key] = append([]time.Time(nil), seed...)
+	if r.inferenceErrorFlushStrikes == nil {
+		r.inferenceErrorFlushStrikes = make(map[inferenceErrorKey][]time.Time)
+	}
+	r.inferenceErrorFlushStrikes[key] = append([]time.Time(nil), seed...)
+	r.mu.Unlock()
+
+	r.RecordInferenceError("s1", "m", 502, "base")
+
+	r.mu.Lock()
+	strikes := append([]time.Time(nil), r.inferenceErrorStrikes[key]...)
+	flush := append([]time.Time(nil), r.inferenceErrorFlushStrikes[key]...)
+	r.mu.Unlock()
+	if len(strikes) == 0 {
+		t.Fatal("main strike list is empty after a recorded flush")
+	}
+	// The bound is the breaker window: everything older than 60 s is gone.
+	// 30 seeded entries at most survive (2 s spacing) plus the strike just
+	// recorded; allow the wall clock a little drift.
+	if len(flush) > int(inferenceErrorWindow/(2*time.Second))+2 {
+		t.Fatalf("flush tags = %d after %d historical flushes, want the slice bounded by the %s window", len(flush), flushed, inferenceErrorWindow)
+	}
+	if len(flush) > len(strikes) {
+		t.Fatalf("flush tags (%d) outnumber live strikes (%d)", len(flush), len(strikes))
+	}
+	for _, ts := range flush {
+		if !containsTimestamp(strikes, ts) {
+			t.Fatalf("flush tag %v marks a strike that is no longer in the window", ts)
+		}
+		if now.Sub(ts) >= inferenceErrorWindow+time.Second {
+			t.Fatalf("flush tag %v is older than the breaker window", ts)
+		}
+	}
+	if !containsTimestamp(flush, strikes[len(strikes)-1]) {
+		t.Fatal("the flush just recorded is not tagged")
+	}
+
+	// A served request clears the shape's history — tags included.
+	r.RecordInferenceSuccess("s1", "m", "base")
+	r.mu.Lock()
+	_, strikesLeft := r.inferenceErrorStrikes[key]
+	_, flushLeft := r.inferenceErrorFlushStrikes[key]
+	r.mu.Unlock()
+	if strikesLeft || flushLeft {
+		t.Fatalf("after success: strikes present=%v flush tags present=%v, want both cleared", strikesLeft, flushLeft)
+	}
+}
+
+// TestInferenceFlushStrikes_NonFlushStrikePrunesTags: the tags slide out of
+// the window on EVERY counted strike, not only on a 502, so they can never
+// reference a strike the main list has already dropped.
+func TestInferenceFlushStrikes_NonFlushStrikePrunesTags(t *testing.T) {
+	r := New(testLogger())
+	bindVersionedSession(t, r, "s1", "0.9.0", true)
+	key := inferenceErrorKey{ProviderID: versionResetStable, ModelID: "m", Shape: "base"}
+
+	stale := time.Now().Add(-2 * inferenceErrorWindow)
+	r.mu.Lock()
+	r.inferenceErrorStrikes[key] = []time.Time{stale}
+	r.inferenceErrorFlushStrikes = map[inferenceErrorKey][]time.Time{key: {stale}}
+	r.mu.Unlock()
+
+	r.RecordInferenceError("s1", "m", 500, "base")
+
+	r.mu.Lock()
+	flush, present := r.inferenceErrorFlushStrikes[key]
+	r.mu.Unlock()
+	if present {
+		t.Fatalf("stale flush tag survived a non-flush strike: %v", flush)
+	}
+}

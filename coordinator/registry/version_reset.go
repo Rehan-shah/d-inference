@@ -35,7 +35,10 @@ import "time"
 // noteIdentityVersionLocked; only a CHANGE from the last version seen for the
 // identity triggers the reset. State lives in identityVersions and
 // inferenceErrorFlushStrikes (Registry, guarded by r.mu; lazily created so
-// bare test registries work).
+// bare test registries work). The flush tags live exactly as long as the
+// strikes they mark: RecordInferenceError slides them out of the breaker
+// window with the strikes and RecordInferenceSuccess drops them with the
+// history, so an identity that never changes version cannot accumulate them.
 
 // disconnectFlushStatusCode is the status the pending-request flush injects
 // (registry.disconnectWithCause) and the marker the fault windows tag.
@@ -117,6 +120,28 @@ func (r *Registry) noteInferenceFlushStrikeLocked(key inferenceErrorKey, at time
 		}
 	}
 	r.inferenceErrorFlushStrikes[key] = append(r.inferenceErrorFlushStrikes[key], at)
+}
+
+// pruneInferenceFlushStrikesLocked drops the key's flush tags that have left
+// the breaker window, mirroring RecordInferenceError's slide of the main
+// strike list so a tag never outlives the strike it marks. Deletes the key
+// when nothing remains. Caller holds r.mu; key is already stable-keyed.
+func (r *Registry) pruneInferenceFlushStrikesLocked(key inferenceErrorKey, now time.Time) {
+	flush, ok := r.inferenceErrorFlushStrikes[key]
+	if !ok {
+		return
+	}
+	kept := flush[:0]
+	for _, ts := range flush {
+		if now.Sub(ts) < inferenceErrorWindow {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) == 0 {
+		delete(r.inferenceErrorFlushStrikes, key)
+		return
+	}
+	r.inferenceErrorFlushStrikes[key] = kept
 }
 
 // clearDisconnectFlushStrikesLocked removes the disconnect-flush (502)
